@@ -20,8 +20,8 @@ DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favico
 .\publish.cmd --no-pause
 ```
 
-首次点击“启动”会把官方 `@deepseek-ai/dsh` 安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，随后运行 `dsh web`。默认浏览器会打开带访问令牌的本地地址；也可从运行日志复制完整地址。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
+首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时会从 Node.js 官网下载 Windows x64 的 Node.js 24 LTS ZIP 并校验 SHA-256，解压到本地工具目录。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web`。以后启动会复用这些本地文件，不需要重复下载。默认浏览器会打开带访问令牌的本地地址；也可从运行日志复制完整地址。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
 
-“检查更新”查询 npm 最新版本；发现新版后，按钮变为“安装更新”，再次点击即可更新。更新前需停止服务。
+“检查更新”查询 npm 最新版本，20 秒未完成会结束查询并恢复按钮；发现新版后，按钮变为“安装更新”，再次点击即可更新。更新前需停止服务。
 
-发布结果仅有 `dist\DeepSeekHarnessLauncher.exe`（约 0.54 MiB）。目标 Windows 电脑无需安装 .NET、MFC 或 Visual C++ 运行库；启动 DeepSeek Harness 仍需 Node.js（含 npm）。
+发布结果仅有 `dist\DeepSeekHarnessLauncher.exe`。目标 Windows 电脑无需预装 .NET、MFC、Visual C++ 运行库或 Node.js；若缺少 Node.js 和 npm，首次使用需要联网下载，自动下载流程使用 Windows PowerShell。

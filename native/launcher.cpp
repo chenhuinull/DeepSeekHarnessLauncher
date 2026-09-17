@@ -24,6 +24,8 @@ static constexpr UINT WM_SERVER_STARTED = WM_APP + 3;
 static constexpr UINT WM_SERVER_READY = WM_APP + 4;
 static constexpr UINT WM_SERVER_EXIT = WM_APP + 5;
 static constexpr int W = 470, H_COLLAPSED = 48, H_EXPANDED = 228;
+static constexpr float buttonCornerRadius = 4.5f;
+static constexpr DWORD updateCheckTimeoutMs = 20'000;
 enum class State { Running, Stopped, Missing, Update };
 enum class Work { Start, Check, InstallUpdate };
 enum class Button { None, Log, Status, Start, Update, Topmost, Minimize, Close };
@@ -87,6 +89,7 @@ static fs::path EntryPoint() { return runtimeDir / L"node_modules" / L"@deepseek
 static fs::path PackageJson() { return runtimeDir / L"node_modules" / L"@deepseek-ai" / L"dsh" / L"package.json"; }
 static fs::path ServerPidFile() { return runtimeDir.parent_path() / L"server.pid"; }
 static fs::path ServerLogFile() { return runtimeDir.parent_path() / L"server.log"; }
+static fs::path LocalNodeRoot() { return runtimeDir.parent_path() / L"tools" / L"node"; }
 static bool Installed() { return fs::exists(EntryPoint()); }
 
 static std::wstring Version() {
@@ -112,15 +115,19 @@ static std::wstring FindOnPath(const wchar_t* name) {
 }
 
 struct NodeTools { std::wstring node, npm; };
-static NodeTools FindNode() {
-    std::wstring node = FindOnPath(L"node.exe");
-    if (node.empty()) throw std::runtime_error("node missing");
-    fs::path root = fs::path(node).parent_path();
-    std::wstring npmCmd = FindOnPath(L"npm.cmd");
-    if (!npmCmd.empty()) root = fs::path(npmCmd).parent_path();
+static std::optional<NodeTools> CompleteNode(const fs::path& root) {
+    fs::path node = root / L"node.exe";
     fs::path npm = root / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
-    if (!fs::exists(npm)) throw std::runtime_error("npm missing");
-    return {node, npm.wstring()};
+    if (fs::is_regular_file(node) && fs::is_regular_file(npm)) return NodeTools{node.wstring(), npm.wstring()};
+    return std::nullopt;
+}
+
+static void PrependLocalNodeToPath() {
+    std::wstring root = LocalNodeRoot().wstring();
+    DWORD length = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+    std::wstring path(length ? length : 1, L'\0');
+    if (length) { DWORD used = GetEnvironmentVariableW(L"PATH", path.data(), length); path.resize(used); }
+    if (path.rfind(root + L";", 0) != 0) SetEnvironmentVariableW(L"PATH", (root + L";" + path).c_str());
 }
 
 static std::wstring Quote(const std::wstring& s) {
@@ -146,7 +153,7 @@ static void SetJob(HANDLE& slot, HANDLE job) { std::lock_guard lock(processMutex
 static void KillJob(HANDLE& slot) { std::lock_guard lock(processMutex); if (slot) TerminateJobObject(slot, 1); }
 
 static DWORD RunNode(const std::wstring& node, const std::vector<std::wstring>& args,
-    std::wstring* output = nullptr) {
+    std::wstring* output = nullptr, DWORD timeoutMs = INFINITE) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE readPipe = nullptr, writePipe = nullptr;
     if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) throw std::runtime_error("pipe");
@@ -169,9 +176,11 @@ static DWORD RunNode(const std::wstring& node, const std::vector<std::wstring>& 
     DWORD launchError = GetLastError();
     CloseHandle(writePipe); if (nullInput != INVALID_HANDLE_VALUE) CloseHandle(nullInput);
     if (!started) { CloseHandle(readPipe); CloseHandle(job); throw std::runtime_error("launch: " + std::to_string(launchError)); }
-    AssignProcessToJobObject(job, pi.hProcess);
+    bool assignedToJob = !!AssignProcessToJobObject(job, pi.hProcess);
     SetJob(workJob, job);
     ResumeThread(pi.hThread); CloseHandle(pi.hThread);
+    ULONGLONG startedAt = GetTickCount64();
+    bool timedOut = false;
     std::string pending;
     char chunk[4096]; DWORD got = 0;
     auto emit = [&](const std::string& raw) {
@@ -182,22 +191,95 @@ static DWORD RunNode(const std::wstring& node, const std::vector<std::wstring>& 
         if (output) { *output += wide; *output += L'\n'; }
         PostLog(wide);
     };
-    while (ReadFile(readPipe, chunk, sizeof(chunk), &got, nullptr) && got) {
-        pending.append(chunk, got);
-        size_t split;
-        while ((split = pending.find('\n')) != std::string::npos) {
-            emit(pending.substr(0, split)); pending.erase(0, split + 1);
+    while (true) {
+        if (timeoutMs != INFINITE && GetTickCount64() - startedAt >= timeoutMs) {
+            timedOut = true;
+            if (!assignedToJob || !TerminateJobObject(job, ERROR_TIMEOUT))
+                TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+            break;
         }
-        if (pending.size() > 65536) { emit(pending); pending.clear(); }
+        DWORD available = 0;
+        if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available) {
+            DWORD toRead = std::min<DWORD>(available, sizeof(chunk));
+            if (ReadFile(readPipe, chunk, toRead, &got, nullptr) && got) {
+                pending.append(chunk, got);
+                size_t split;
+                while ((split = pending.find('\n')) != std::string::npos) {
+                    emit(pending.substr(0, split)); pending.erase(0, split + 1);
+                }
+                if (pending.size() > 65536) { emit(pending); pending.clear(); }
+                continue;
+            }
+        }
+        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+        Sleep(50);
     }
     if (!pending.empty()) emit(pending);
     CloseHandle(readPipe);
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD wait = WaitForSingleObject(pi.hProcess, timedOut ? 5000 : INFINITE);
+    if (wait == WAIT_TIMEOUT) { TerminateProcess(pi.hProcess, ERROR_TIMEOUT); WaitForSingleObject(pi.hProcess, 5000); }
     DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
     { std::lock_guard lock(processMutex); workJob = nullptr; }
     CloseHandle(job);
+    if (timedOut) throw std::runtime_error("update timeout");
     return code;
+}
+
+static void InstallLocalNode() {
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(2), RT_RCDATA);
+    if (!resource) throw std::runtime_error("node installer missing");
+    HGLOBAL loaded = LoadResource(module, resource);
+    const char* bytes = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+    DWORD size = SizeofResource(module, resource);
+    if (!bytes || !size) throw std::runtime_error("node installer missing");
+
+    fs::path toolsDir = LocalNodeRoot().parent_path();
+    fs::create_directories(toolsDir);
+    fs::path script = toolsDir / L"install-node.ps1";
+    {
+        std::ofstream file(script, std::ios::binary | std::ios::trunc);
+        file.write(bytes, size);
+        if (!file) throw std::runtime_error("node installer write failed");
+    }
+    std::wstring powershell = FindOnPath(L"powershell.exe");
+    if (powershell.empty()) throw std::runtime_error("powershell missing");
+    DWORD code = RunNode(powershell, {L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass",
+        L"-File", script.wstring(), L"-InstallRoot", LocalNodeRoot().wstring()});
+    if (code != 0 || !CompleteNode(LocalNodeRoot())) throw std::runtime_error("node download failed");
+}
+
+static NodeTools FindNode() {
+    if (auto local = CompleteNode(LocalNodeRoot())) {
+        PrependLocalNodeToPath();
+        PostLog(L"使用本地 Node.js 和 npm。");
+        return *local;
+    }
+
+    std::wstring systemNode = FindOnPath(L"node.exe");
+    if (!systemNode.empty()) {
+        fs::path root = fs::path(systemNode).parent_path();
+        if (auto system = CompleteNode(root)) {
+            PostLog(L"使用系统 Node.js 和 npm。");
+            return *system;
+        }
+        std::wstring npmCmd = FindOnPath(L"npm.cmd");
+        if (!npmCmd.empty()) {
+            fs::path npm = fs::path(npmCmd).parent_path() / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
+            if (fs::is_regular_file(npm)) {
+                PostLog(L"使用系统 Node.js 和 npm。");
+                return {systemNode, npm.wstring()};
+            }
+        }
+    }
+
+    PostLog(L"未找到完整的 Node.js 和 npm，正在下载到本地（首次使用可能需要几分钟）…");
+    InstallLocalNode();
+    auto local = CompleteNode(LocalNodeRoot());
+    if (!local) throw std::runtime_error("node download failed");
+    PrependLocalNodeToPath();
+    return *local;
 }
 
 static unsigned long long CreationTime(HANDLE process) {
@@ -368,9 +450,10 @@ static void InstallHarness(const NodeTools& tools) {
 
 static std::wstring ExceptionMessage(const std::exception& e) {
     std::string what = e.what();
-    if (what == "node missing") return L"未找到 Node.js。请先安装 Node.js 并重启启动器。";
-    if (what == "npm missing") return L"未找到 npm。请安装完整的 Node.js 发行版。";
+    if (what == "powershell missing") return L"未找到 Windows PowerShell，无法自动下载 Node.js。";
+    if (what == "node download failed") return L"下载 Node.js 失败。请检查网络后重试，或自行安装 Node.js。";
     if (what == "pipe") return L"无法建立子进程输出管道。";
+    if (what == "update timeout") return L"检查更新超过 " + std::to_wstring(updateCheckTimeoutMs / 1000) + L" 秒，已停止检查。";
     if (what.rfind("install failed:", 0) == 0) return L"安装失败（退出码 " + Utf8(what.substr(16)) + L"）。请查看运行日志。";
     return L"操作失败：" + Utf8(what);
 }
@@ -401,7 +484,7 @@ static void Worker(Work work) {
         } else {
             PostLog(L"正在检查 npm 上的最新版本…");
             std::wstring output;
-            DWORD code = RunNode(tools.node, {tools.npm, L"view", L"@deepseek-ai/dsh", L"version", L"--json"}, &output);
+            DWORD code = RunNode(tools.node, {tools.npm, L"view", L"@deepseek-ai/dsh", L"version", L"--json"}, &output, updateCheckTimeoutMs);
             if (code != 0) throw std::runtime_error("check failed");
             size_t first = output.find(L'\"'), last = output.find(L'\"', first + 1);
             if (first == std::wstring::npos || last == std::wstring::npos) throw std::runtime_error("version missing");
@@ -485,7 +568,7 @@ static void DrawButton(Graphics& g, const UiRect& r, const std::wstring& label, 
     Color fg = primary ? Color(255,255,255) : Color(35,50,76);
     if (disabled) { bg = Color(248,250,252); fg = Color(160,170,185); border = Color(221,228,238); }
     else if (hoverButton == button) { bg = primary ? Color(29,78,216) : Color(239,246,255); }
-    GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, 6);
+    GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, buttonCornerRadius);
     SolidBrush fill(bg); Pen edge(border, 1); g.FillPath(&fill, &path); g.DrawPath(&edge, &path);
 }
 
@@ -514,11 +597,14 @@ static void Paint() {
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
     DrawButton(g,topRect,topmost ? L"关闭置顶" : L"开启置顶",Button::Topmost);
-    GraphicsPath titlePath; Rounded(titlePath,406.5f,10.5f,49,27,6); SolidBrush pale(Color(248,250,252));
-    Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath); g.DrawPath(&light,&titlePath);
+    GraphicsPath titlePath; Rounded(titlePath,406.5f,10.5f,49,27,buttonCornerRadius); SolidBrush pale(Color(248,250,252));
+    Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
+        GraphicsState saved = g.Save(); g.SetClip(&titlePath);
         SolidBrush hl(Color(236,242,249)); g.FillRectangle(&hl,hoverButton == Button::Minimize ? 407 : 431,11,24,26);
+        g.Restore(saved);
     }
+    g.DrawPath(&light,&titlePath);
     Pen divider(Color(226,232,240),1); g.DrawLine(&divider,431,16,431,32);
     Pen dash(Color(71,85,105),1.8f); g.DrawLine(&dash,414,25,423,25);
     Pen cross(Color(185,28,28),1.8f); g.DrawLine(&cross,439,19,447,29); g.DrawLine(&cross,447,19,439,29);
@@ -610,7 +696,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         SetStatus(attached?State::Running:(Installed()?State::Stopped:State::Missing),
             attached?L"检测到正在运行的 DeepSeek Harness Web 服务。":
             (Installed()?L"点击“启动”运行 DeepSeek Harness。":L"点击“启动”自动安装 DeepSeek Harness。"));
-        AppendLog(L"启动器已就绪。首次启动会安装 DeepSeek Harness，可能需要几分钟。");
+        AppendLog(L"启动器已就绪。首次启动会按需下载工具并安装 DeepSeek Harness，可能需要几分钟。");
         if (attached) AppendLog(L"检测到已运行的 DeepSeek Harness，可以点击“停止”结束服务。");
         return 0;
     }
