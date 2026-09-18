@@ -1523,6 +1523,28 @@ static void OnClick(Button button) {
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_NCCALCSIZE: if (wp) return 0; break;
+    case WM_NCHITTEST: {
+        POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &point);
+        int x = (int)(point.x / scaleFactor), y = (int)(point.y / scaleFactor);
+        // The whale icon both moves the window and folds it. Handing it to the system as a
+        // caption is what lets Windows tell "press and move" (drag) from "two quick
+        // clicks" (double click) — doing the drag ourselves would swallow the second
+        // click — and it delivers WM_NCLBUTTONDBLCLK for the fold.
+        if (iconRect.contains(x, y)) return HTCAPTION;
+        if (mini) return statusRect.contains(x, y) ? HTCLIENT : HTCAPTION;
+        if (y < 50 && Hit(x, y) == Button::None) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_NCLBUTTONDBLCLK: {
+        POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd, &point);
+        int x = (int)(point.x / scaleFactor), y = (int)(point.y / scaleFactor);
+        if (iconRect.contains(x, y)) ToggleMini();
+        return 0;
+    }
+    case WM_NCRBUTTONUP:
+        return 0;   // the strip stays free of the system menu
     case WM_GETMINMAXINFO: {
         // A window with a caption and a thick frame may not shrink below the system's
         // minimum tracking size (about 136 px wide), which would keep the folded chip
@@ -1532,7 +1554,6 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         limits->ptMinTrackSize.y = Scaled(H_COLLAPSED);
         return 0;
     }
-    case WM_NCHITTEST: return HTCLIENT;
     case WM_CREATE: {
         windowHandle = hwnd;
         DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
@@ -1583,12 +1604,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_MOUSELEAVE: hoverButton=Button::None; InvalidateRect(hwnd,nullptr,FALSE); return 0;
     case WM_LBUTTONDOWN: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
-        Button hit=Hit(x,y);
-        // The whale icon is the fold/unfold handle, so a click there never starts a drag:
-        // otherwise the move loop would swallow the second click of a double click.
-        if(iconRect.contains(x,y)) return 0;
-        if(hit==Button::None && y<(mini ? H_COLLAPSED : 50)) { ReleaseCapture(); SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0); }
-        else if(hit!=Button::None) OnClick(hit);
+        OnClick(Hit(x,y));   // dragging is handled through WM_NCHITTEST/HTCAPTION
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
