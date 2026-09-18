@@ -8,9 +8,11 @@ Windows 桌面启动器，提供启动/停止、检查更新、窗口始终置�
 
 日志默认收起；启动失败时自动展开，服务启动成功时自动收起。也可以随时点击标题栏的“日志”手动切换。
 
-鲸鱼图标旁的状态点：绿色表示已启动，黄色表示未启动，红色表示未安装 DeepSeek Harness，紫色表示未启动且有更新。悬停状态点可查看说明。
+鲸鱼图标旁的状态点：绿色表示已启动（包括接管的外部服务），黄色表示未启动，红色表示未安装 DeepSeek Harness，紫色表示未启动且有更新。悬停状态点可查看说明。
 
 DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favicon.ico)。
+
+启动器同一时间只允许一个实例：重复双击只会把已经打开的窗口唤到前台（最小化时自动还原），不会再出现第二个窗口。
 
 ## 使用
 
@@ -20,8 +22,16 @@ DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favico
 .\publish.cmd --no-pause
 ```
 
-首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时会从 Node.js 官网下载 Windows x64 的 Node.js 24 LTS ZIP 并校验 SHA-256，解压到本地工具目录。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web`。以后启动会复用这些本地文件，不需要重复下载。默认浏览器会打开带访问令牌的本地地址；也可从运行日志复制完整地址。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
+首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时由启动器自己下载 Windows x64 的 Node.js ZIP 并校验 SHA-256，解压到本地工具目录。下载在启动器进程内用 WinHTTP 完成，解压调用系统自带的 `tar.exe`，**不依赖 Windows PowerShell**。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web`。以后启动会复用这些本地文件，不需要重复下载。默认浏览器会打开带访问令牌的本地地址；也可从运行日志复制完整地址。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
 
-“检查更新”查询 npm 最新版本，20 秒未完成会结束查询并恢复按钮；发现新版后，按钮变为“安装更新”，再次点击即可更新。更新前需停止服务。
+首次安装使用启动器内置的已知可用版本（Node.js `24.16.0`、`@deepseek-ai/dsh@0.1.5-rc.2`），因此同一份 exe 在任何机器上装出的结果一致。需要更新时点“检查更新”，再点“安装更新”装 npm 上的最新版；服务成功启动过的版本会记入 `known-good.txt`，若新版本启动失败，按钮会变成“回退到 <版本>”，一键装回上一个可用版本。
 
-发布结果仅有 `dist\DeepSeekHarnessLauncher.exe`。目标 Windows 电脑无需预装 .NET、MFC、Visual C++ 运行库或 Node.js；若缺少 Node.js 和 npm，首次使用需要联网下载，自动下载流程使用 Windows PowerShell。
+下载 Node.js 时依次尝试 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量、已启用的系统代理、直连，并会在 Node.js 官网、清华 TUNA、npmmirror 三个来源之间自动切换；如果系统设置里保存过代理但当前是关闭状态，全部失败后还会再试一次该地址（本地代理客户端未开启系统代理时很常见）。下载过程中日志会自动展开并显示百分比与已下载大小。压缩包只从与校验文件相同的来源下载，SHA-256 不一致或解压不完整时本次下载会被整体删除。
+
+本地工具目录里的 Node.js 版本与启动器内置版本不一致时（例如升级了 exe），下次点击“启动”会自动把它更新到内置版本；更新失败只会记录一条日志并继续使用原有版本，不会因此无法启动。托管在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 的副本归启动器所有，系统已安装的 Node.js 不会被改动。
+
+启动器按本地端口 3080 判断 Web 服务是否在运行，而不只依赖自己写下的进程记录。因此，即使服务是在终端里用 `npx @deepseek-ai/dsh web` 或 `dsh web` 手动启动的，启动器也会识别并接管它，状态显示“已启动”；点击“停止”结束这类外部服务前会弹出确认。反过来，如果端口被别的程序占用，启动会被取消并在日志中说明占用端口的进程，不会再生硬地拉一个必然因端口冲突而退出的服务。
+
+“检查更新”查询 npm 最新版本，20 秒未完成会结束查询并恢复按钮；发现新版后，按钮变为“安装更新”，再次点击即可更新。更新前需停止服务。本机还没有 Node.js 与 npm 时，“检查更新”不会为了查询版本号而下载运行时，只会提示先点“启动”。
+
+发布结果仅有 `dist\DeepSeekHarnessLauncher.exe`。目标 Windows 电脑无需预装 .NET、MFC、Visual C++ 运行库、Node.js 或 PowerShell；若缺少 Node.js 和 npm，首次使用需要联网下载，解压依赖 Windows 10 1803 及以上自带的 `tar.exe`。

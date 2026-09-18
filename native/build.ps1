@@ -18,7 +18,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'rc failed' }
     & cl.exe /nologo /std:c++20 /utf-8 /O1 /GL /MT /EHsc /DUNICODE /D_UNICODE /c launcher.cpp "/Fo$object"
     if ($LASTEXITCODE -ne 0) { throw 'cl failed' }
-    & link.exe /nologo /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS "/OUT:$executable" $object $resource user32.lib gdi32.lib gdiplus.lib dwmapi.lib shell32.lib ole32.lib uuid.lib comctl32.lib
+    & link.exe /nologo /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS "/OUT:$executable" $object $resource user32.lib gdi32.lib gdiplus.lib dwmapi.lib shell32.lib ole32.lib uuid.lib comctl32.lib iphlpapi.lib ws2_32.lib winhttp.lib bcrypt.lib advapi32.lib version.lib
     if ($LASTEXITCODE -ne 0) { throw 'link failed' }
 } finally {
     Pop-Location

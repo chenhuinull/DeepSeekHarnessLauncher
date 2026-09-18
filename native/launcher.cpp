@@ -1,12 +1,18 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h>
 #include <gdiplus.h>
 #include <dwmapi.h>
 #include <commctrl.h>
+#include <winhttp.h>
+#include <bcrypt.h>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <functional>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -23,14 +29,22 @@ static constexpr UINT WM_WORK_DONE = WM_APP + 2;
 static constexpr UINT WM_SERVER_STARTED = WM_APP + 3;
 static constexpr UINT WM_SERVER_READY = WM_APP + 4;
 static constexpr UINT WM_SERVER_EXIT = WM_APP + 5;
+static constexpr UINT WM_SERVER_ADOPTED = WM_APP + 6;
+static constexpr UINT WM_DOWNLOAD = WM_APP + 7;
 static constexpr int W = 470, H_COLLAPSED = 48, H_EXPANDED = 228;
+static constexpr USHORT serverPort = 3080;
+static constexpr DWORD readyProbeIntervalMs = 1'000;
 static constexpr float buttonCornerRadius = 4.5f;
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
+// Versions this build is known to work with. Downloads stay reproducible and a
+// newer dsh is only installed when the user asks for it.
+static constexpr wchar_t pinnedNodeVersion[] = L"24.16.0";
+static constexpr wchar_t pinnedDshVersion[] = L"0.1.5-rc.2";
 enum class State { Running, Stopped, Missing, Update };
-enum class Work { Start, Check, InstallUpdate };
+enum class Work { Start, Check, InstallUpdate, Rollback };
 enum class Button { None, Log, Status, Start, Update, Topmost, Minimize, Close };
-struct Result { Work work; bool ok; std::wstring message; std::wstring version; bool installed; bool update; };
-struct ServerIdentity { DWORD pid = 0; unsigned long long created = 0; };
+struct Result { Work work; bool ok; std::wstring message; std::wstring version; std::wstring info; bool installed; bool update; };
+struct ServerIdentity { DWORD pid = 0; unsigned long long created = 0; bool owned = true; };
 struct UiRect { int x, y, w, h; bool contains(int px, int py) const { return px >= x && px < x + w && py >= y && py < y + h; } };
 
 static HWND windowHandle, logEdit;
@@ -43,10 +57,11 @@ static fs::path runtimeDir;
 static constexpr wchar_t serverJobName[] = L"Local\\DeepSeekHarnessLauncher.Server";
 static bool expanded = false, topmost = true, busy = false, serverRunning = false;
 static bool systemCorners = false;
-static bool serverReady = false, stopping = false, updateAvailable = false;
+static bool stopping = false, updateAvailable = false, serverExternal = false;
+static std::atomic_bool serverReady{false};
 static State status = State::Missing;
 static Button hoverButton = Button::None;
-static std::wstring logBuffer, statusTip = L"未安装固件", updateLabel = L"检查更新";
+static std::wstring logBuffer, statusTip = L"未安装固件", updateLabel = L"检查更新", rollbackVersion;
 static HWND tooltip;
 static TOOLINFOW tipInfo{};
 static float scaleFactor = 1.0f;
@@ -67,6 +82,81 @@ static std::wstring Utf8(const std::string& s) {
     std::wstring out(n, L'\0');
     MultiByteToWideChar(codepage, 0, s.data(), (int)s.size(), out.data(), n);
     return out;
+}
+
+static std::string Narrow(const std::wstring& s) {
+    if (s.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+struct PortService { DWORD pid = 0; std::wstring image; bool harness = false; };
+
+static DWORD PortOwnerPid(USHORT port) {
+    DWORD size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    std::vector<unsigned char> buffer(size);
+    if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) return 0;
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const auto& row = table->table[i];
+        if ((DWORD)ntohs((u_short)row.dwLocalPort) != port) continue;
+        if (row.dwLocalAddr != htonl(INADDR_LOOPBACK) && row.dwLocalAddr != 0) continue;
+        return row.dwOwningPid;
+    }
+    return 0;
+}
+
+// The DSH web server answers an unauthenticated request with "dsh web authentication required".
+static bool ProbeHarness(USHORT port) {
+    HINTERNET session = WinHttpOpen(L"DeepSeekHarnessLauncher/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 600, 600, 1200, 1200);
+    bool result = false;
+    if (HINTERNET connect = WinHttpConnect(session, L"127.0.0.1", port, 0)) {
+        if (HINTERNET request = WinHttpOpenRequest(connect, L"GET", L"/", nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, 0)) {
+            if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(request, nullptr)) {
+                std::string body;
+                DWORD available = 0;
+                while (body.size() < 8192 && WinHttpQueryDataAvailable(request, &available) && available) {
+                    std::string chunk(available, '\0');
+                    DWORD read = 0;
+                    if (!WinHttpReadData(request, chunk.data(), available, &read) || !read) break;
+                    body.append(chunk.data(), read);
+                }
+                std::string lower;
+                lower.reserve(body.size());
+                for (char c : body) lower += (char)tolower((unsigned char)c);
+                result = lower.find("dsh web") != std::string::npos ||
+                    lower.find("deepseek harness") != std::string::npos;
+            }
+            WinHttpCloseHandle(request);
+        }
+        WinHttpCloseHandle(connect);
+    }
+    WinHttpCloseHandle(session);
+    return result;
+}
+
+static std::optional<PortService> InspectPort(USHORT port) {
+    DWORD pid = PortOwnerPid(port);
+    if (!pid) return std::nullopt;
+    PortService service;
+    service.pid = pid;
+    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[MAX_PATH * 4];
+        DWORD length = (DWORD)std::size(path);
+        if (QueryFullProcessImageNameW(process, 0, path, &length)) service.image.assign(path, length);
+        CloseHandle(process);
+    }
+    service.harness = ProbeHarness(port);
+    return service;
 }
 
 static std::wstring WinError(DWORD code = GetLastError()) {
@@ -226,55 +316,374 @@ static DWORD RunNode(const std::wstring& node, const std::vector<std::wstring>& 
     return code;
 }
 
-static void InstallLocalNode() {
-    HMODULE module = GetModuleHandleW(nullptr);
-    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(2), RT_RCDATA);
-    if (!resource) throw std::runtime_error("node installer missing");
-    HGLOBAL loaded = LoadResource(module, resource);
-    const char* bytes = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
-    DWORD size = SizeofResource(module, resource);
-    if (!bytes || !size) throw std::runtime_error("node installer missing");
+struct HttpSession {
+    HINTERNET session = nullptr, connect = nullptr, request = nullptr;
+    unsigned long long length = 0;
+};
 
+static void CloseHttp(HttpSession& http) {
+    if (http.request) WinHttpCloseHandle(http.request);
+    if (http.connect) WinHttpCloseHandle(http.connect);
+    if (http.session) WinHttpCloseHandle(http.session);
+    http = {};
+}
+
+// Open a GET request. An empty proxy connects directly; otherwise the proxy is used
+// explicitly, so a local proxy keeps working even when the system proxy switch is off.
+static bool BeginHttpGet(const std::wstring& url, const std::wstring& proxy, HttpSession& http, std::wstring& error) {
+    URL_COMPONENTS parts{}; parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = parts.dwHostNameLength = parts.dwUrlPathLength = parts.dwExtraInfoLength = (DWORD)-1;
+    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &parts)) { error = L"URL 无法解析"; return false; }
+    std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    http.session = WinHttpOpen(L"DeepSeekHarnessLauncher/1.0",
+        proxy.empty() ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy.empty() ? WINHTTP_NO_PROXY_NAME : proxy.c_str(), WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!http.session) { error = L"无法初始化 WinHTTP"; return false; }
+    WinHttpSetTimeouts(http.session, 10'000, 10'000, 20'000, 30'000);
+    http.connect = WinHttpConnect(http.session, host.c_str(), parts.nPort, 0);
+    DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    http.request = http.connect
+        ? WinHttpOpenRequest(http.connect, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, flags)
+        : nullptr;
+    if (!http.request) { error = L"无法建立 HTTP 请求"; CloseHttp(http); return false; }
+    if (!WinHttpSendRequest(http.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(http.request, nullptr)) {
+        error = L"请求发送失败"; CloseHttp(http); return false;
+    }
+    DWORD statusCode = 0, size = sizeof(statusCode);
+    WinHttpQueryHeaders(http.request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &size, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) { error = L"HTTP " + std::to_wstring(statusCode); CloseHttp(http); return false; }
+    DWORD contentLength = 0; size = sizeof(contentLength);
+    if (WinHttpQueryHeaders(http.request, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &contentLength, &size, WINHTTP_NO_HEADER_INDEX))
+        http.length = contentLength;
+    return true;
+}
+
+template <typename Sink>
+static bool ReadHttpBody(HttpSession& http, Sink&& sink) {
+    char buffer[65536]; DWORD available = 0;
+    while (WinHttpQueryDataAvailable(http.request, &available) && available) {
+        DWORD want = available > sizeof(buffer) ? (DWORD)sizeof(buffer) : available, got = 0;
+        if (!WinHttpReadData(http.request, buffer, want, &got) || !got) return false;
+        if (!sink(buffer, got)) return false;
+    }
+    return true;
+}
+
+static std::wstring FetchText(const std::wstring& url, const std::wstring& proxy, std::wstring& error) {
+    HttpSession http;
+    if (!BeginHttpGet(url, proxy, http, error)) return {};
+    std::string body;
+    bool ok = ReadHttpBody(http, [&](const char* data, DWORD size) {
+        body.append(data, size);
+        return body.size() <= 1'000'000;
+    });
+    CloseHttp(http);
+    if (!ok) { error = L"读取响应失败"; return {}; }
+    return Utf8(body);
+}
+
+static bool DownloadFile(const std::wstring& url, const std::wstring& proxy, const fs::path& destination,
+    const std::function<void(unsigned long long, unsigned long long)>& progress, std::wstring& error) {
+    HttpSession http;
+    if (!BeginHttpGet(url, proxy, http, error)) return false;
+    std::ofstream file(destination, std::ios::binary | std::ios::trunc);
+    if (!file) { CloseHttp(http); error = L"无法写入下载文件"; return false; }
+    unsigned long long done = 0;
+    bool ok = ReadHttpBody(http, [&](const char* data, DWORD size) {
+        file.write(data, size);
+        done += size;
+        if (!file) return false;
+        progress(done, http.length);
+        return true;
+    });
+    file.flush();
+    bool good = file.good();
+    CloseHttp(http);
+    if (!ok || !good) { error = L"下载中断"; return false; }
+    return true;
+}
+
+static std::wstring Megabytes(unsigned long long bytes) {
+    wchar_t text[32];
+    wsprintfW(text, L"%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    return text;
+}
+
+static std::wstring Lowercase(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+    return text;
+}
+
+// Proxy candidates: an explicit environment variable first, then the system proxy when
+// it is switched on, then a direct connection. Stage 1 retries the address saved in the
+// system settings even if it is currently switched off, which is what makes a stopped
+// local proxy (for example 127.0.0.1:7897) still usable as a last resort.
+static std::wstring EnvironmentProxy() {
+    for (const wchar_t* name : {L"HTTPS_PROXY", L"https_proxy", L"HTTP_PROXY", L"http_proxy", L"ALL_PROXY", L"all_proxy"}) {
+        DWORD length = GetEnvironmentVariableW(name, nullptr, 0);
+        if (!length) continue;
+        std::wstring value(length, L'\0');
+        DWORD used = GetEnvironmentVariableW(name, value.data(), length);
+        value.resize(used);
+        if (value.rfind(L"http://", 0) == 0) value.erase(0, 7);
+        else if (value.rfind(L"https://", 0) == 0) value.erase(0, 8);
+        while (!value.empty() && value.back() == L'/') value.pop_back();
+        if (!value.empty()) return value;
+    }
+    return {};
+}
+
+static std::wstring SystemProxy(bool& enabled) {
+    enabled = false;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return {};
+    wchar_t text[512]{}; DWORD size = sizeof(text), type = 0;
+    std::wstring server;
+    if (RegQueryValueExW(key, L"ProxyServer", nullptr, &type, (LPBYTE)text, &size) == ERROR_SUCCESS && type == REG_SZ)
+        server = text;
+    DWORD flag = 0; size = sizeof(flag);
+    if (RegQueryValueExW(key, L"ProxyEnable", nullptr, &type, (LPBYTE)&flag, &size) == ERROR_SUCCESS && type == REG_DWORD)
+        enabled = flag != 0;
+    RegCloseKey(key);
+    for (const wchar_t* scheme : {L"https=", L"http="}) {
+        size_t start = server.find(scheme);
+        if (start == std::wstring::npos) continue;
+        size_t end = server.find(L';', start);
+        server = server.substr(start + 6, end == std::wstring::npos ? std::wstring::npos : end - start - 6);
+        break;
+    }
+    while (!server.empty() && (server.back() == L';' || server.back() == L' ')) server.pop_back();
+    return server;
+}
+
+static std::vector<std::wstring> ProxyCandidates(int stage) {
+    std::vector<std::wstring> proxies;
+    std::wstring fromEnvironment = EnvironmentProxy();
+    bool enabled = false;
+    std::wstring recorded = SystemProxy(enabled);
+    if (stage == 0) {
+        if (!fromEnvironment.empty()) proxies.push_back(fromEnvironment);
+        if (enabled && !recorded.empty()) proxies.push_back(recorded);
+        proxies.push_back(L"");
+    } else if (!enabled && !recorded.empty() && recorded != fromEnvironment) {
+        proxies.push_back(recorded);
+    }
+    return proxies;
+}
+
+static std::vector<std::wstring> NodeSourceBases() {
+    std::wstring tag = L"v" + std::wstring(pinnedNodeVersion);
+    return {
+        L"https://nodejs.org/dist/" + tag,
+        L"https://mirrors.tuna.tsinghua.edu.cn/nodejs-release/" + tag,
+        L"https://registry.npmmirror.com/-/binary/node/" + tag,
+    };
+}
+
+static std::wstring ChecksumFor(const std::wstring& manifest, const std::wstring& fileName) {
+    std::wstring wanted = Lowercase(fileName);
+    size_t position = 0;
+    while (position < manifest.size()) {
+        size_t end = manifest.find(L'\n', position);
+        std::wstring line = manifest.substr(position, end == std::wstring::npos ? std::wstring::npos : end - position);
+        position = end == std::wstring::npos ? manifest.size() : end + 1;
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+        std::wstring lower = Lowercase(line);
+        if (lower.size() < wanted.size() ||
+            lower.compare(lower.size() - wanted.size(), wanted.size(), wanted) != 0) continue;
+        size_t split = lower.find_first_of(L" \t");
+        if (split == std::wstring::npos || split < 64) continue;
+        return lower.substr(0, 64);
+    }
+    return {};
+}
+
+struct NodeSource { std::wstring proxy; std::wstring base; };
+
+static bool SelectNodeSource(const std::wstring& fileName, NodeSource& chosen, std::wstring& manifest) {
+    std::vector<std::wstring> bases = NodeSourceBases();
+    for (int stage = 0; stage < 2; stage++) {
+        for (const auto& proxy : ProxyCandidates(stage)) {
+            for (const auto& base : bases) {
+                std::wstring error;
+                std::wstring text = FetchText(base + L"/SHASUMS256.txt", proxy, error);
+                if (text.empty() || ChecksumFor(text, fileName).empty()) {
+                    PostLog(std::wstring(L"下载源不可用（") + (proxy.empty() ? L"直连" : L"代理 " + proxy) + L"）：" +
+                        base + L" · " + (error.empty() ? L"缺少校验值" : error));
+                    continue;
+                }
+                chosen = NodeSource{proxy, base};
+                manifest = text;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool Sha256File(const fs::path& path, std::string& hex) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) return false;
+    DWORD objectSize = 0, hashSize = 0, written = 0;
+    BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objectSize, sizeof(objectSize), &written, 0);
+    BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, (PUCHAR)&hashSize, sizeof(hashSize), &written, 0);
+    std::vector<unsigned char> object(objectSize), digest(hashSize);
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    bool ok = objectSize && hashSize &&
+        BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0));
+    std::ifstream file(path, std::ios::binary);
+    if (!file) ok = false;
+    std::vector<char> buffer(1 << 16);
+    while (ok && file) {
+        file.read(buffer.data(), (std::streamsize)buffer.size());
+        std::streamsize got = file.gcount();
+        if (got > 0 && !BCRYPT_SUCCESS(BCryptHashData(hash, (PUCHAR)buffer.data(), (ULONG)got, 0))) ok = false;
+    }
+    if (ok && !BCRYPT_SUCCESS(BCryptFinishHash(hash, digest.data(), hashSize, 0))) ok = false;
+    if (hash) BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!ok) return false;
+    static const char digits[] = "0123456789abcdef";
+    hex.clear();
+    for (unsigned char byte : digest) { hex += digits[byte >> 4]; hex += digits[byte & 15]; }
+    return true;
+}
+
+static void ExtractArchive(const fs::path& archive, const fs::path& destination) {
+    std::wstring tar = FindOnPath(L"tar.exe");
+    if (tar.empty()) throw std::runtime_error("tar missing");
+    fs::create_directories(destination);
+    DWORD code = RunNode(tar, {L"-xf", archive.wstring(), L"-C", destination.wstring()});
+    if (code != 0) throw std::runtime_error("extract failed: " + std::to_string(code));
+}
+
+static std::wstring FileVersionString(const fs::path& file) {
+    DWORD size = GetFileVersionInfoSizeW(file.c_str(), nullptr);
+    if (!size) return {};
+    std::vector<unsigned char> data(size);
+    if (!GetFileVersionInfoW(file.c_str(), 0, size, data.data())) return {};
+    VS_FIXEDFILEINFO* info = nullptr; UINT length = 0;
+    if (!VerQueryValueW(data.data(), L"\\", (LPVOID*)&info, &length) || !info) return {};
+    wchar_t text[64];
+    wsprintfW(text, L"%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+        HIWORD(info->dwFileVersionLS));
+    return text;
+}
+
+static void InstallLocalNode() {
+    std::wstring version = pinnedNodeVersion;
+    std::wstring folder = L"node-v" + version + L"-win-x64";
+    std::wstring fileName = folder + L".zip";
     fs::path toolsDir = LocalNodeRoot().parent_path();
     fs::create_directories(toolsDir);
-    fs::path script = toolsDir / L"install-node.ps1";
-    {
-        std::ofstream file(script, std::ios::binary | std::ios::trunc);
-        file.write(bytes, size);
-        if (!file) throw std::runtime_error("node installer write failed");
+    fs::path staging = toolsDir / (L".node-download-" + std::to_wstring(GetTickCount64()) + L"-" +
+        std::to_wstring(GetCurrentProcessId()));
+    fs::path archive = staging / L"node.zip";
+    fs::path expanded = staging / L"expanded";
+    try {
+        fs::create_directories(staging);
+        PostLog(L"本机缺少 Node.js 与 npm，开始下载 Node.js v" + version + L"（启动器内置的已知可用版本）。");
+        NodeSource source; std::wstring manifest;
+        if (!SelectNodeSource(fileName, source, manifest)) throw std::runtime_error("node download failed");
+        PostLog(L"下载源：" + source.base + (source.proxy.empty() ? L"（直连）" : L"（代理 " + source.proxy + L"）"));
+        std::wstring expected = ChecksumFor(manifest, fileName);
+        if (!closing) PostMessageW(windowHandle, WM_DOWNLOAD, 0, 0);
+        int lastTenth = -1, lastPosted = -1;
+        std::wstring error;
+        bool downloaded = DownloadFile(source.base + L"/" + fileName, source.proxy, archive,
+            [&](unsigned long long done, unsigned long long total) {
+                int percent = total ? (int)(done * 100 / total) : 0;
+                if (percent / 10 != lastTenth) {
+                    lastTenth = percent / 10;
+                    PostLog(L"下载进度 " + std::to_wstring(percent) + L"% (" + Megabytes(done) + L" / " +
+                        (total ? Megabytes(total) : std::wstring(L"未知大小")) + L")");
+                }
+                if (percent - lastPosted >= 5) {
+                    lastPosted = percent;
+                    if (!closing) PostMessageW(windowHandle, WM_DOWNLOAD, (WPARAM)percent, 0);
+                }
+            }, error);
+        if (!downloaded) throw std::runtime_error("node download failed");
+        PostLog(L"校验 SHA-256 …");
+        std::string actual;
+        if (!Sha256File(archive, actual) || Lowercase(Utf8(actual)) != expected)
+            throw std::runtime_error("checksum mismatch");
+        ExtractArchive(archive, expanded);
+        fs::path extracted = expanded / folder;
+        if (!CompleteNode(extracted)) throw std::runtime_error("archive incomplete");
+        if (fs::exists(LocalNodeRoot())) fs::remove_all(LocalNodeRoot());
+        fs::rename(extracted, LocalNodeRoot());
+        PostLog(L"Node.js v" + version + L" 已就绪。");
+    } catch (...) {
+        std::error_code ignored;
+        fs::remove_all(staging, ignored);
+        throw;
     }
-    std::wstring powershell = FindOnPath(L"powershell.exe");
-    if (powershell.empty()) throw std::runtime_error("powershell missing");
-    DWORD code = RunNode(powershell, {L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass",
-        L"-File", script.wstring(), L"-InstallRoot", LocalNodeRoot().wstring()});
-    if (code != 0 || !CompleteNode(LocalNodeRoot())) throw std::runtime_error("node download failed");
+    std::error_code ignored;
+    fs::remove_all(staging, ignored);
+}
+
+static std::wstring ExceptionMessage(const std::exception& e);
+
+static std::optional<NodeTools> SystemNode() {
+    std::wstring systemNode = FindOnPath(L"node.exe");
+    if (systemNode.empty()) return std::nullopt;
+    fs::path root = fs::path(systemNode).parent_path();
+    if (auto system = CompleteNode(root)) {
+        PostLog(L"使用系统 Node.js 和 npm。");
+        return system;
+    }
+    std::wstring npmCmd = FindOnPath(L"npm.cmd");
+    if (!npmCmd.empty()) {
+        fs::path npm = fs::path(npmCmd).parent_path() / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
+        if (fs::is_regular_file(npm)) {
+            PostLog(L"使用系统 Node.js 和 npm。");
+            return NodeTools{systemNode, npm.wstring()};
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<NodeTools> FindNodeWithoutDownload() {
+    if (auto local = CompleteNode(LocalNodeRoot())) {
+        PrependLocalNodeToPath();
+        PostLog(L"使用本地 Node.js 和 npm。");
+        return local;
+    }
+    return SystemNode();
 }
 
 static NodeTools FindNode() {
     if (auto local = CompleteNode(LocalNodeRoot())) {
-        PrependLocalNodeToPath();
-        PostLog(L"使用本地 Node.js 和 npm。");
-        return *local;
-    }
-
-    std::wstring systemNode = FindOnPath(L"node.exe");
-    if (!systemNode.empty()) {
-        fs::path root = fs::path(systemNode).parent_path();
-        if (auto system = CompleteNode(root)) {
-            PostLog(L"使用系统 Node.js 和 npm。");
-            return *system;
+        std::wstring version = FileVersionString(LocalNodeRoot() / L"node.exe");
+        if (version.empty() || version == pinnedNodeVersion) {
+            PrependLocalNodeToPath();
+            PostLog(version.empty() ? L"使用本地 Node.js 和 npm。" : L"使用本地 Node.js v" + version + L" 和 npm。");
+            return *local;
         }
-        std::wstring npmCmd = FindOnPath(L"npm.cmd");
-        if (!npmCmd.empty()) {
-            fs::path npm = fs::path(npmCmd).parent_path() / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
-            if (fs::is_regular_file(npm)) {
-                PostLog(L"使用系统 Node.js 和 npm。");
-                return {systemNode, npm.wstring()};
-            }
+        // The launcher ships a pinned runtime. Refreshing the private copy keeps the pin
+        // meaningful after an upgrade, but a network failure must not break a working copy.
+        PostLog(L"本地 Node.js v" + version + L" 与启动器内置的 v" + pinnedNodeVersion + L" 不一致，正在更新运行时…");
+        try {
+            InstallLocalNode();
+        } catch (const std::exception& e) {
+            PostLog(L"更新 Node.js 失败：" + ExceptionMessage(e) + L"；继续使用本地 v" + version + L"。");
         }
+        if (auto refreshed = CompleteNode(LocalNodeRoot())) {
+            PrependLocalNodeToPath();
+            return *refreshed;
+        }
+        if (auto system = SystemNode()) return *system;
+        throw std::runtime_error("node download failed");
     }
-
-    PostLog(L"未找到完整的 Node.js 和 npm，正在下载到本地（首次使用可能需要几分钟）…");
+    if (auto system = SystemNode()) return *system;
     InstallLocalNode();
     auto local = CompleteNode(LocalNodeRoot());
     if (!local) throw std::runtime_error("node download failed");
@@ -295,13 +704,16 @@ static std::optional<ServerIdentity> ReadServerIdentity() {
     std::ifstream file(ServerPidFile());
     ServerIdentity id;
     if (!(file >> id.pid >> id.created) || !id.pid || !id.created) return std::nullopt;
+    int owned = 1;  // Older records only stored pid and creation time: they were started by a launcher.
+    file >> owned;
+    id.owned = owned != 0;
     return id;
 }
 
 static void SaveServerIdentity(ServerIdentity id) {
     fs::create_directories(ServerPidFile().parent_path());
     std::ofstream file(ServerPidFile(), std::ios::trunc);
-    file << id.pid << ' ' << id.created << '\n';
+    file << id.pid << ' ' << id.created << ' ' << (id.owned ? 1 : 0) << '\n';
     file.flush();
     if (!file) throw std::runtime_error("pid file");
 }
@@ -359,8 +771,18 @@ static DWORD MonitorServer(HANDLE process, HANDLE job, ServerIdentity id, bool a
     }
     std::string pending;
     bool exited = false;
+    ULONGLONG nextProbe = GetTickCount64() + readyProbeIntervalMs;
     while (!closing) {
         ReadServerLog(offset, pending);
+        // The log line is the fast path; probing the port keeps "ready" working
+        // even when dsh changes what it prints.
+        if (!serverReady && GetTickCount64() >= nextProbe) {
+            nextProbe = GetTickCount64() + readyProbeIntervalMs;
+            if (ProbeHarness(serverPort)) {
+                serverReady = true;
+                if (!closing) PostMessageW(windowHandle, WM_SERVER_READY, 0, 0);
+            }
+        }
         if (WaitForSingleObject(process, 250) == WAIT_OBJECT_0) { exited = true; break; }
     }
     if (exited) ReadServerLog(offset, pending);
@@ -401,7 +823,7 @@ static DWORD RunServer(const std::wstring& node) {
         throw std::runtime_error("launch: " + std::to_string(launchError));
     }
     if (job && !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = nullptr; }
-    ServerIdentity id{pi.dwProcessId, CreationTime(pi.hProcess)};
+    ServerIdentity id{pi.dwProcessId, CreationTime(pi.hProcess), true};
     try { SaveServerIdentity(id); }
     catch (...) {
         TerminateProcess(pi.hProcess, 1);
@@ -415,6 +837,7 @@ static DWORD RunServer(const std::wstring& node) {
         serverIdentity = id;
     }
     ResumeThread(pi.hThread); CloseHandle(pi.hThread);
+    serverExternal = false;
     if (!closing) PostMessageW(windowHandle, WM_SERVER_STARTED, 0, 0);
     return MonitorServer(pi.hProcess, job, id, false);
 }
@@ -431,6 +854,7 @@ static bool AttachRunningServer() {
         serverIdentity = *saved;
     }
     serverRunning = true;
+    serverExternal = !saved->owned;
     serverReady = true;
     std::thread([process, job, id = *saved] {
         DWORD code = MonitorServer(process, job, id, true);
@@ -439,35 +863,134 @@ static bool AttachRunningServer() {
     return true;
 }
 
-static void InstallHarness(const NodeTools& tools) {
+// Adopt a DSH web server this launcher did not start (for example one started with
+// npx in a terminal). It is identified by the listening socket on serverPort, so a
+// missing or stale pid file no longer hides a live service.
+static bool AdoptRunningService() {
+    auto service = InspectPort(serverPort);
+    if (!service || !service->harness) return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+        FALSE, service->pid);
+    if (!process) return false;
+    ServerIdentity id{service->pid, CreationTime(process), false};
+    if (!id.created) { CloseHandle(process); return false; }
+    HANDLE job = OpenJobObjectW(JOB_OBJECT_TERMINATE | JOB_OBJECT_QUERY, FALSE, serverJobName);
+    {
+        std::lock_guard lock(processMutex);
+        serverJob = job;
+        serverIdentity = id;
+    }
+    try { SaveServerIdentity(id); } catch (...) {}
+    serverRunning = true;
+    serverReady = true;
+    serverExternal = true;
+    std::wstring image = service->image.empty() ? L"未知进程" : fs::path(service->image).filename().wstring();
+    PostLog(L"检测到已在运行的 DeepSeek Harness Web 服务（PID " + std::to_wstring(id.pid) + L"，" + image +
+        L"），已接管；点击“停止”可结束它。");
+    std::thread([process, job, id] {
+        DWORD code = MonitorServer(process, job, id, true);
+        if (!closing) PostMessageW(windowHandle, WM_SERVER_EXIT, code, 0);
+    }).detach();
+    if (!closing) PostMessageW(windowHandle, WM_SERVER_ADOPTED, (WPARAM)id.pid, 0);
+    return true;
+}
+
+static void InstallHarness(const NodeTools& tools, const std::wstring& version) {
     fs::create_directories(runtimeDir);
-    PostLog(L"安装 @deepseek-ai/dsh@latest …");
+    std::wstring spec = L"@deepseek-ai/dsh@" + version;
+    PostLog(L"安装 " + spec + L" …");
     DWORD code = RunNode(tools.node,
-        {tools.npm, L"install", L"--prefix", runtimeDir.wstring(), L"--no-audit", L"--no-fund", L"@deepseek-ai/dsh@latest"});
+        {tools.npm, L"install", L"--prefix", runtimeDir.wstring(), L"--no-audit", L"--no-fund", spec});
     if (code != 0 || !Installed()) throw std::runtime_error("install failed: " + std::to_string(code));
     PostLog(L"安装完成，版本 " + Version() + L"。");
 }
 
+// The version that last reached "service ready" is remembered, so a broken update can
+// be rolled back without guessing.
+static fs::path KnownGoodFile() { return runtimeDir.parent_path() / L"known-good.txt"; }
+
+static std::wstring KnownGoodVersion() {
+    std::ifstream file(KnownGoodFile(), std::ios::binary);
+    std::string text;
+    std::getline(file, text);
+    while (!text.empty() && (text.back() == '\r' || text.back() == ' ')) text.pop_back();
+    return Utf8(text);
+}
+
+static void SaveKnownGoodVersion(const std::wstring& version) {
+    if (version.empty()) return;
+    std::ofstream file(KnownGoodFile(), std::ios::trunc);
+    file << Narrow(version) << '\n';
+    file.flush();
+}
+
 static std::wstring ExceptionMessage(const std::exception& e) {
     std::string what = e.what();
-    if (what == "powershell missing") return L"未找到 Windows PowerShell，无法自动下载 Node.js。";
-    if (what == "node download failed") return L"下载 Node.js 失败。请检查网络后重试，或自行安装 Node.js。";
+    if (what == "node download failed") return L"下载 Node.js 失败。请检查网络或代理后重试，也可自行安装 Node.js。";
+    if (what == "checksum mismatch") return L"Node.js 压缩包 SHA-256 校验失败，本次下载已删除。";
+    if (what == "archive incomplete") return L"Node.js 压缩包内容不完整，本次下载已删除。";
+    if (what == "tar missing") return L"系统缺少 tar.exe，无法解压 Node.js 压缩包（需要 Windows 10 1803 及以上）。";
     if (what == "pipe") return L"无法建立子进程输出管道。";
+    if (what == "rollback missing") return L"没有可回退的版本记录。";
     if (what == "update timeout") return L"检查更新超过 " + std::to_wstring(updateCheckTimeoutMs / 1000) + L" 秒，已停止检查。";
+    if (what.rfind("extract failed: ", 0) == 0) return L"解压 Node.js 压缩包失败（退出码 " + Utf8(what.substr(16)) + L"）。";
     if (what.rfind("install failed:", 0) == 0) return L"安装失败（退出码 " + Utf8(what.substr(16)) + L"）。请查看运行日志。";
+    if (what.rfind("port busy: ", 0) == 0) return L"本地端口 " + std::to_wstring((int)serverPort) +
+        L" 已被其它程序占用（" + Utf8(what.substr(11)) + L"），已取消启动；请先结束占用该端口的程序。";
     return L"操作失败：" + Utf8(what);
 }
 
 static void Worker(Work work) {
+    // Never race a live web service: adopt it instead of starting a second one that
+    // would only die with EADDRINUSE.
+    if (work == Work::Start && AdoptRunningService()) return;
     auto result = std::make_unique<Result>(); result->work = work; result->ok = false;
+    auto finish = [&]() -> bool {
+        if (!closing && !PostMessageW(windowHandle, WM_WORK_DONE, 0, (LPARAM)result.get())) return false;
+        result.release();
+        return true;
+    };
     try {
+        if (work == Work::Check) {
+            // A version check must never pull tens of megabytes of runtime.
+            auto existing = FindNodeWithoutDownload();
+            if (!existing) {
+                result->installed = Installed();
+                result->info = result->installed
+                    ? L"未找到 Node.js 与 npm，暂时无法查询 npm 上的最新版本。"
+                    : L"本机尚未安装 Node.js 与 DeepSeek Harness；点击“启动”会自动下载并安装。";
+                finish();
+                return;
+            }
+            PostLog(L"正在检查 npm 上的最新版本…");
+            std::wstring output;
+            DWORD code = RunNode(existing->node, {existing->npm, L"view", L"@deepseek-ai/dsh", L"version", L"--json"},
+                &output, updateCheckTimeoutMs);
+            if (code != 0) throw std::runtime_error("check failed");
+            size_t first = output.find(L'\"'), last = output.find(L'\"', first + 1);
+            if (first == std::wstring::npos || last == std::wstring::npos) throw std::runtime_error("version missing");
+            result->version = output.substr(first + 1, last - first - 1);
+            result->installed = Installed();
+            result->update = result->installed && Version() != result->version;
+            result->ok = true;
+            finish();
+            return;
+        }
+
         NodeTools tools = FindNode();
         if (work == Work::Start) {
-            if (!Installed()) InstallHarness(tools);
+            if (!Installed()) InstallHarness(tools, pinnedDshVersion);
             if (closing) return;
+            if (auto service = InspectPort(serverPort)) {
+                if (!service->harness || !AdoptRunningService()) {
+                    std::string name = service->image.empty()
+                        ? "未知进程" : Narrow(fs::path(service->image).filename().wstring());
+                    throw std::runtime_error("port busy: " + std::to_string(service->pid) + " " + name);
+                }
+                return;
+            }
             result->installed = true;
-            if (!PostMessageW(windowHandle, WM_WORK_DONE, 0, (LPARAM)result.get())) return;
-            result.release();
+            if (!finish()) return;
             PostLog(L"正在启动 DeepSeek Harness Web 服务…");
             try {
                 DWORD code = RunServer(tools.node);
@@ -479,23 +1002,14 @@ static void Worker(Work work) {
             return;
         }
         if (work == Work::InstallUpdate) {
-            InstallHarness(tools);
-            result->ok = true; result->installed = true; result->version = Version();
+            InstallHarness(tools, L"latest");
         } else {
-            PostLog(L"正在检查 npm 上的最新版本…");
-            std::wstring output;
-            DWORD code = RunNode(tools.node, {tools.npm, L"view", L"@deepseek-ai/dsh", L"version", L"--json"}, &output, updateCheckTimeoutMs);
-            if (code != 0) throw std::runtime_error("check failed");
-            size_t first = output.find(L'\"'), last = output.find(L'\"', first + 1);
-            if (first == std::wstring::npos || last == std::wstring::npos) throw std::runtime_error("version missing");
-            result->version = output.substr(first + 1, last - first - 1);
-            result->installed = Installed();
-            result->update = result->installed && Version() != result->version;
-            result->ok = true;
+            if (rollbackVersion.empty()) throw std::runtime_error("rollback missing");
+            InstallHarness(tools, rollbackVersion);
         }
+        result->ok = true; result->installed = true; result->version = Version();
     } catch (const std::exception& e) { result->message = ExceptionMessage(e); }
-    if (!closing && !PostMessageW(windowHandle, WM_WORK_DONE, 0, (LPARAM)result.get())) return;
-    result.release();
+    finish();
 }
 
 static void AppendLog(const std::wstring& line) {
@@ -639,23 +1153,37 @@ static void OnClick(Button button) {
     case Button::Start:
         if (busy) break;
         if (serverRunning) {
+            ServerIdentity id;
+            { std::lock_guard lock(processMutex); id = serverIdentity; }
+            if (serverExternal) {
+                std::wstring question = L"当前 Web 服务不是由本启动器启动的（PID " + std::to_wstring(id.pid) +
+                    L"）。\r\n结束它会中断正在进行的会话，确定要停止吗？";
+                if (MessageBoxW(windowHandle, question.c_str(), L"停止 Web 服务",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST) != IDYES) break;
+            }
             stopping = true; busy = true;
             bool terminated = false;
-            ServerIdentity id;
             {
                 std::lock_guard lock(processMutex);
-                id = serverIdentity;
-                if (serverJob) terminated = !!TerminateJobObject(serverJob, 1);
+                if (!serverExternal && serverJob) terminated = !!TerminateJobObject(serverJob, 1);
             }
             if (!terminated) {
                 HANDLE process = OpenLiveServer(id);
                 if (process) { terminated = !!TerminateProcess(process, 1); CloseHandle(process); }
             }
+            if (!terminated) {
+                std::lock_guard lock(processMutex);
+                if (serverJob) terminated = !!TerminateJobObject(serverJob, 1);
+            }
             if (terminated) SetStatus(State::Stopped,L"正在关闭 Web 服务…");
             else { busy = false; stopping = false; AppendLog(L"停止失败：无法结束 Web 服务进程。"); }
         } else { serverReady = false; BeginWork(Work::Start); }
         break;
-    case Button::Update: if (!busy && !serverRunning) BeginWork(updateAvailable ? Work::InstallUpdate : Work::Check); break;
+    case Button::Update:
+        if (busy || serverRunning) break;
+        if (!rollbackVersion.empty()) BeginWork(Work::Rollback);
+        else BeginWork(updateAvailable ? Work::InstallUpdate : Work::Check);
+        break;
     case Button::Topmost:
         topmost = !topmost;
         SetWindowPos(windowHandle,topmost ? HWND_TOPMOST : HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);
@@ -692,7 +1220,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         tipInfo.uId=1; tipInfo.rect={Scaled(114),Scaled(10),Scaled(182),Scaled(38)};
         tipInfo.lpszText=statusTip.data(); SendMessageW(tooltip,TTM_ADDTOOLW,0,(LPARAM)&tipInfo);
         Layout();
-        bool attached = AttachRunningServer();
+        bool attached = AttachRunningServer() || AdoptRunningService();
         SetStatus(attached?State::Running:(Installed()?State::Stopped:State::Missing),
             attached?L"检测到正在运行的 DeepSeek Harness Web 服务。":
             (Installed()?L"点击“启动”运行 DeepSeek Harness。":L"点击“启动”自动安装 DeepSeek Harness。"));
@@ -726,18 +1254,25 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             AppendLog((r->work==Work::Start?L"启动失败：":L"更新操作失败：")+r->message);
             SetStatus(Installed()?State::Stopped:State::Missing,r->message);
             if(r->work==Work::Start) ExpandLog(true);
+        } else if(!r->info.empty()) {
+            AppendLog(r->info);
+            SetStatus(Installed()?State::Stopped:State::Missing,r->info);
         } else if(r->work==Work::Start) {
-            updateAvailable=false; updateLabel=L"检查更新";
+            updateAvailable=false; updateLabel=L"检查更新"; rollbackVersion.clear();
             SetStatus(State::Stopped,L"正在等待 Web 服务就绪…");
         } else if(r->work==Work::InstallUpdate) {
-            updateAvailable=false; updateLabel=L"检查更新";
+            updateAvailable=false; updateLabel=L"检查更新"; rollbackVersion.clear();
             AppendLog(L"更新完成，版本 "+r->version+L"。");
             SetStatus(State::Stopped,L"已安装版本 "+r->version+L"。");
+        } else if(r->work==Work::Rollback) {
+            updateAvailable=false; updateLabel=L"检查更新"; rollbackVersion.clear();
+            AppendLog(L"已回退到版本 "+r->version+L"。");
+            SetStatus(State::Stopped,L"已回退到版本 "+r->version+L"。");
         } else if(!r->installed) {
             AppendLog(L"最新版本 "+r->version+L"；本机尚未安装，点击“启动”即可安装。");
             SetStatus(State::Missing,L"npm 最新版本 "+r->version+L"。启动时会自动安装。");
         } else if(r->update) {
-            updateAvailable=true; updateLabel=L"安装更新";
+            updateAvailable=true; updateLabel=L"安装更新"; rollbackVersion.clear();
             AppendLog(L"发现新版本："+Version()+L" → "+r->version+L"。再次点击“安装更新”执行更新。");
             SetStatus(State::Update,L"当前 "+Version()+L"，npm 最新 "+r->version+L"。");
         } else {
@@ -746,18 +1281,35 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         }
         InvalidateRect(hwnd,nullptr,FALSE); return 0;
     }
-    case WM_SERVER_STARTED: serverRunning=true; busy=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
+    case WM_DOWNLOAD:
+        if (wp == 0) ExpandLog(true);
+        SetStatus(status,L"正在下载 Node.js… "+std::to_wstring((int)wp)+L"%");
+        return 0;
+    case WM_SERVER_STARTED: serverRunning=true; serverExternal=false; busy=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
+    case WM_SERVER_ADOPTED:
+        serverRunning=true; serverReady=true; serverExternal=true; busy=false;
+        SetStatus(State::Running,L"检测到已在运行的 Web 服务（PID "+std::to_wstring((DWORD)wp)+L"），已接管；点击“停止”可结束它。");
+        InvalidateRect(hwnd,nullptr,FALSE); return 0;
     case WM_SERVER_READY:
-        serverReady=true; SetStatus(State::Running,L"Web 服务已就绪；浏览器将自动打开，访问地址见运行日志。");
+        serverReady=true;
+        if(!serverExternal) SaveKnownGoodVersion(Version());
+        rollbackVersion.clear(); updateLabel=L"检查更新";
+        SetStatus(State::Running,L"Web 服务已就绪；浏览器将自动打开，访问地址见运行日志。");
         ExpandLog(false); return 0;
     case WM_SERVER_EXIT: {
         if (!serverRunning && !busy) return 0;
         bool failed=!stopping&&!serverReady;
-        serverRunning=false; busy=false;
+        serverRunning=false; busy=false; serverReady=false; serverExternal=false;
+        std::wstring known=KnownGoodVersion();
+        if(failed&&!known.empty()&&known!=Version()) {
+            rollbackVersion=known; updateAvailable=false; updateLabel=L"回退到 "+known;
+        }
         State stoppedState=updateAvailable?State::Update:(Installed()?State::Stopped:State::Missing);
         SetStatus(stoppedState,failed?L"服务未能启动，请查看日志。":L"Web 服务已停止。");
         AppendLog(failed?L"启动失败，服务退出代码 "+std::to_wstring((DWORD)wp)+L"。":
             (stopping?L"Web 服务已停止。":L"Web 服务已退出，代码 "+std::to_wstring((DWORD)wp)+L"。"));
+        if(failed&&!rollbackVersion.empty())
+            AppendLog(L"上次可用版本是 "+rollbackVersion+L"，可点击“回退到 "+rollbackVersion+L"”恢复。");
         if(failed) ExpandLog(true);
         stopping=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
     }
@@ -768,7 +1320,29 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     return DefWindowProcW(hwnd,message,wp,lp);
 }
 
+// A second launch must not create a rival window that fights over the same service:
+// bring the running launcher to the front and leave.
+static bool ActivateExistingInstance() {
+    HWND existing = nullptr;
+    for (int attempt = 0; attempt < 20 && !existing; attempt++) {
+        existing = FindWindowW(L"DeepSeekHarnessLauncherNative", nullptr);
+        if (!existing) Sleep(100);
+    }
+    if (!existing) return false;
+    if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
+    SetForegroundWindow(existing);
+    FLASHWINFO flash{sizeof(flash), existing, FLASHW_ALL, 3, 0};
+    FlashWindowEx(&flash);
+    return true;
+}
+
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
+    HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\DeepSeekHarnessLauncher.SingleInstance");
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        ActivateExistingInstance();
+        CloseHandle(instanceMutex);
+        return 0;
+    }
     SetProcessDPIAware();
     GdiplusStartupInput gdiplusInput; ULONG_PTR gdiplusToken;
     GdiplusStartup(&gdiplusToken,&gdiplusInput,nullptr);
