@@ -1662,7 +1662,9 @@ static void CreateLogBars(HWND parent) {
 static void AppendLog(const std::wstring& line) {
     if (!logEdit) return;
     SYSTEMTIME now; GetLocalTime(&now);
-    wchar_t stamp[32]; wsprintfW(stamp, L"[%02d:%02d:%02d] ", now.wHour, now.wMinute, now.wSecond);
+    // No trailing space after the bracket: this font draws a space half a Chinese glyph wide, which
+    // reads as a conspicuous gap between the timestamp and a Chinese message.
+    wchar_t stamp[32]; wsprintfW(stamp, L"[%02d:%02d:%02d]", now.wHour, now.wMinute, now.wSecond);
     std::wstring entry = stamp; entry += line;
     // The separator goes in front of the entry, never after it. Ending the text with a newline leaves
     // an empty line at the bottom that the view is pinned to, so the last line of the panel shows

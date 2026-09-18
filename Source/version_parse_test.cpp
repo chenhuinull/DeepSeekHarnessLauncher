@@ -139,6 +139,22 @@ static void CheckLogBars() {
     AppendLog(wide);
     Pump();
     Check(logMaxLineWidth >= LogLineWidth(wide), "the widest line is tracked in pixels as it arrives");
+    {
+        // The timestamp is followed straight away by the message: in this font a space is half a
+        // Chinese glyph wide and showed up as a gap the reader did not want.
+        int last = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) - 1;
+        wchar_t first[128]{};
+        *reinterpret_cast<WORD*>(first) = 127;
+        int copied = (int)SendMessageW(logEdit, EM_GETLINE, (WPARAM)last, (LPARAM)first);
+        // The stamp is ten characters wide: [HH:MM:SS], so the bracket is at 9 and the message's
+        // first character at 10.
+        Check(copied > 10 && first[0] == L'[' && first[9] == L']' && first[10] != L' ',
+            "the newest line starts with the timestamp, followed straight away by the message");
+        int stamp = LogLineWidth(L"[00:11:39]");
+        int space = LogLineWidth(L"[00:11:39] ") - stamp;
+        std::printf("      timestamp %d px, the space it no longer carries %d px, a Chinese glyph %d px\n",
+            stamp, space, LogLineWidth(L"\u5df2"));
+    }
 
     ClearLog();
     Pump();
