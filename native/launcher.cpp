@@ -35,12 +35,21 @@ static constexpr int H_COLLAPSED = 48, H_EXPANDED = 228;
 // The whole button row is derived from these numbers, so the window width follows the
 // button width instead of being a separate constant.
 static constexpr int buttonWidth = 60, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
-static constexpr int firstButtonX = 42, buttonCount = 5;
+// The status control is a lamp only, so it stays as narrow as a square indicator.
+static constexpr int indicatorWidth = 28;
+static constexpr int firstButtonX = 42;
+static constexpr int logX = firstButtonX;
+static constexpr int statusX = logX + buttonWidth + buttonGap;
+static constexpr int startX = statusX + indicatorWidth + buttonGap;
+static constexpr int updateX = startX + buttonWidth + buttonGap;
+static constexpr int topmostX = updateX + buttonWidth + buttonGap;
+static constexpr int lastButtonRight = topmostX + buttonWidth;
 static constexpr int titleClusterGap = 8, titleButtonWidth = 25, rightMargin = 14;
-static constexpr int lastButtonRight = firstButtonX + buttonCount * buttonWidth + (buttonCount - 1) * buttonGap;
 static constexpr int titleClusterX = lastButtonRight + titleClusterGap;
 static constexpr int W = titleClusterX + 2 * titleButtonWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
+static constexpr int maxLogLines = 50'000;
+static constexpr int trimChunk = 500;
 static constexpr DWORD readyProbeIntervalMs = 1'000;
 static constexpr float buttonCornerRadius = 4.5f;
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
@@ -70,16 +79,18 @@ static bool stopping = false, updateAvailable = false, serverExternal = false;
 static std::atomic_bool serverReady{false};
 static State status = State::Missing;
 static Button hoverButton = Button::None;
-static std::wstring logBuffer, statusTip = L"未安装固件", updateLabel = L"检查更新", rollbackVersion;
+static std::wstring statusTip = L"未安装固件", updateLabel = L"检查更新", rollbackVersion;
+static int logLineCount = 0;
+static bool logHovered = false;
 static HWND tooltip;
 static TOOLINFOW tipInfo{};
 static float scaleFactor = 1.0f;
 
-static const UiRect logRect{firstButtonX, buttonTop, buttonWidth, buttonHeight};
-static const UiRect statusRect{firstButtonX + buttonWidth + buttonGap, buttonTop, buttonWidth, buttonHeight};
-static const UiRect startRect{firstButtonX + 2 * (buttonWidth + buttonGap), buttonTop, buttonWidth, buttonHeight};
-static const UiRect updateRect{firstButtonX + 3 * (buttonWidth + buttonGap), buttonTop, buttonWidth, buttonHeight};
-static const UiRect topRect{firstButtonX + 4 * (buttonWidth + buttonGap), buttonTop, buttonWidth, buttonHeight};
+static const UiRect logRect{logX, buttonTop, buttonWidth, buttonHeight};
+static const UiRect statusRect{statusX, buttonTop, indicatorWidth, buttonHeight};
+static const UiRect startRect{startX, buttonTop, buttonWidth, buttonHeight};
+static const UiRect updateRect{updateX, buttonTop, buttonWidth, buttonHeight};
+static const UiRect topRect{topmostX, buttonTop, buttonWidth, buttonHeight};
 static const UiRect minRect{titleClusterX, buttonTop, titleButtonWidth, buttonHeight};
 static const UiRect closeRect{titleClusterX + titleButtonWidth, buttonTop, titleButtonWidth, buttonHeight};
 
@@ -1021,16 +1032,83 @@ static void Worker(Work work) {
     finish();
 }
 
+static int LogLineHeight() {
+    HDC dc = GetDC(logEdit);
+    if (!dc) return 0;
+    HFONT font = (HFONT)SendMessageW(logEdit, WM_GETFONT, 0, 0);
+    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
+    TEXTMETRICW metrics{};
+    bool ok = GetTextMetricsW(dc, &metrics);
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(logEdit, dc);
+    return ok ? metrics.tmHeight + metrics.tmExternalLeading : 0;
+}
+
+static bool LogOverflows() {
+    if (!logEdit) return false;
+    RECT client{}; GetClientRect(logEdit, &client);
+    int lineHeight = LogLineHeight();
+    if (client.bottom <= 0 || lineHeight <= 0) return false;
+    int visible = client.bottom / lineHeight;
+    return (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) > visible + 1;
+}
+
+// EM_GETSEL's return value packs both positions into 16 bits, which is wrong once the
+// log passes 64k characters; the pointer form reports the real 32-bit range.
+static bool LogSelectionRange(LONG& start, LONG& end) {
+    DWORD from = 0, to = 0;
+    SendMessageW(logEdit, EM_GETSEL, (WPARAM)&from, (LPARAM)&to);
+    start = (LONG)from; end = (LONG)to;
+    return end > start;
+}
+
+// The bar stays out of the way until it is useful: content that overflows and either
+// the pointer is over the box or something is selected.
+static void UpdateLogScrollBar() {
+    if (!logEdit) return;
+    LONG start = 0, end = 0;
+    bool selected = LogSelectionRange(start, end);
+    ShowScrollBar(logEdit, SB_VERT, (logHovered || selected) && LogOverflows());
+}
+
+static void ClearLog() {
+    if (!logEdit) return;
+    logLineCount = 0;
+    SetWindowTextW(logEdit, L"");
+    ShowScrollBar(logEdit, SB_VERT, FALSE);
+}
+
 static void AppendLog(const std::wstring& line) {
+    if (!logEdit) return;
     SYSTEMTIME now; GetLocalTime(&now);
     wchar_t stamp[32]; wsprintfW(stamp, L"[%02d:%02d:%02d] ", now.wHour, now.wMinute, now.wSecond);
-    logBuffer += stamp; logBuffer += line; logBuffer += L"\r\n";
-    if (logBuffer.size() > 200000) logBuffer.erase(0, logBuffer.size() - 150000);
-    if (logEdit) {
-        SetWindowTextW(logEdit, logBuffer.c_str());
-        SendMessageW(logEdit, EM_SETSEL, (WPARAM)logBuffer.size(), (LPARAM)logBuffer.size());
-        SendMessageW(logEdit, EM_SCROLLCARET, 0, 0);
+    std::wstring entry = stamp; entry += line; entry += L"\r\n";
+    // Append instead of rebuilding the whole box: with a 50k line cap a full
+    // SetWindowText per line would be quadratic.
+    int length = GetWindowTextLengthW(logEdit);
+    SendMessageW(logEdit, EM_SETSEL, length, length);
+    SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)entry.c_str());
+    for (wchar_t c : entry) if (c == L'\n') ++logLineCount;
+    if (logLineCount > maxLogLines) {
+        // Drop a whole chunk rather than one line: deleting from the front of an edit
+        // control moves the remaining text, so doing it per line is needlessly costly.
+        int excess = logLineCount - maxLogLines;
+        if (excess < trimChunk) excess = trimChunk;
+        if (excess > logLineCount) excess = logLineCount;
+        int cut = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)excess, 0);
+        if (cut > 0) {
+            SendMessageW(logEdit, EM_SETSEL, 0, cut);
+            SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+            logLineCount -= excess;
+        }
     }
+    // Park the caret at the start of the last line: it keeps the view pinned to the
+    // bottom without dragging it sideways for long lines.
+    int lastLine = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) - 1;
+    int lastStart = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)lastLine, 0);
+    if (lastStart >= 0) SendMessageW(logEdit, EM_SETSEL, lastStart, lastStart);
+    SendMessageW(logEdit, EM_SCROLLCARET, 0, 0);
+    UpdateLogScrollBar();
 }
 
 // The log box offers only what makes sense for a read-only log: copy the selection
@@ -1040,8 +1118,8 @@ static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, 1, L"复制");
     AppendMenuW(menu, MF_STRING, 2, L"清除");
-    DWORD selection = (DWORD)SendMessageW(logEdit, EM_GETSEL, 0, 0);
-    if (HIWORD(selection) == LOWORD(selection)) EnableMenuItem(menu, 1, MF_BYCOMMAND | MF_GRAYED);
+    LONG from = 0, to = 0;
+    if (!LogSelectionRange(from, to)) EnableMenuItem(menu, 1, MF_BYCOMMAND | MF_GRAYED);
     POINT point{};
     if (screenPosition == (LPARAM)-1) GetCursorPos(&point);
     else { point.x = GET_X_LPARAM(screenPosition); point.y = GET_Y_LPARAM(screenPosition); }
@@ -1051,12 +1129,58 @@ static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
     DestroyMenu(menu);
     PostMessageW(windowHandle, WM_NULL, 0, 0);
     if (command == 1) SendMessageW(logEdit, WM_COPY, 0, 0);
-    else if (command == 2) { logBuffer.clear(); SetWindowTextW(logEdit, L""); }
+    else if (command == 2) ClearLog();
 }
 
 static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
-    if (message == WM_CONTEXTMENU) { ShowLogMenu(hwnd, lp); return 0; }
+    switch (message) {
+    case WM_CONTEXTMENU: ShowLogMenu(hwnd, lp); return 0;
+    case WM_KEYDOWN:
+        // The stock edit menu is gone, so select-all has to be provided here. The async
+        // state covers key messages that were posted rather than generated by real input.
+        if (wp == 'A' && ((GetKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000))) {
+            SendMessageW(hwnd, EM_SETSEL, 0, (LPARAM)-1);
+            UpdateLogScrollBar();
+            return 0;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (!logHovered) {
+            logHovered = true;
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&track);
+            UpdateLogScrollBar();
+        }
+        break;
+    case WM_MOUSELEAVE:
+        logHovered = false;
+        UpdateLogScrollBar();
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_KEYUP:
+        UpdateLogScrollBar();
+        break;
+    }
     return DefSubclassProc(hwnd, message, wp, lp);
+}
+
+// Single place that defines the log control, so the behaviour under test is the same
+// one the window creates.
+static int Scaled(int n);
+
+static void CreateLogEdit(HWND parent) {
+    logEdit = CreateWindowExW(0,L"EDIT",L"",
+        WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|ES_AUTOHSCROLL|ES_NOHIDESEL,
+        0,0,0,0,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
+    SendMessageW(logEdit,WM_SETFONT,(WPARAM)font,TRUE);
+    logBackground = CreateSolidBrush(RGB(255,255,255));
+    SetWindowSubclass(logEdit, LogEditProc, 1, 0);
+    // A multiline edit defaults to a 30k character limit; the line cap is the only limit
+    // this box should have, otherwise appends fail silently once it is hit.
+    SendMessageW(logEdit, EM_SETLIMITTEXT, 0, 0);
+    ShowScrollBar(logEdit, SB_VERT, FALSE);
 }
 
 static void SetStatus(State state, const std::wstring& detail) {
@@ -1078,6 +1202,7 @@ static void Layout() {
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(20), Scaled(53), Scaled(W - 40), Scaled(157), SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(logEdit, expanded ? SW_SHOW : SW_HIDE);
+        UpdateLogScrollBar();
     }
     InvalidateRect(windowHandle, nullptr, TRUE);
 }
@@ -1121,8 +1246,8 @@ static void DrawButton(Graphics& g, const UiRect& r, const std::wstring& label, 
     SolidBrush fill(bg); Pen edge(border, 1); g.FillPath(&fill, &path); g.DrawPath(&edge, &path);
 }
 
-static void DrawCaption(HDC dc, const UiRect& r, const std::wstring& text, COLORREF color, bool statusLabel = false) {
-    RECT bounds{Scaled(r.x + (statusLabel ? 15 : 0)), Scaled(r.y), Scaled(r.x + r.w), Scaled(r.y + r.h)};
+static void DrawCaption(HDC dc, const UiRect& r, const std::wstring& text, COLORREF color) {
+    RECT bounds{Scaled(r.x), Scaled(r.y), Scaled(r.x + r.w), Scaled(r.y + r.h)};
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, color);
     DrawTextW(dc, text.c_str(), -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
@@ -1141,8 +1266,9 @@ static void Paint() {
         Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
     }
     DrawButton(g,logRect,L"日志",Button::Log);
-    DrawButton(g,statusRect,L"状态",Button::Status);
-    SolidBrush dot(ColorForStatus()); g.FillEllipse(&dot,statusRect.x + 12,19,10,10);
+    DrawButton(g,statusRect,L"",Button::Status);
+    SolidBrush dot(ColorForStatus());
+    g.FillEllipse(&dot,statusRect.x + (indicatorWidth - 10) / 2,buttonTop + (buttonHeight - 10) / 2,10,10);
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
     DrawButton(g,topRect,topmost ? L"关闭置顶" : L"开启置顶",Button::Topmost);
@@ -1170,7 +1296,6 @@ static void Paint() {
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
     HGDIOBJ previousFont = SelectObject(memory,font);
     DrawCaption(memory,logRect,L"日志",RGB(35,50,76));
-    DrawCaption(memory,statusRect,L"状态",RGB(35,50,76),true);
     DrawCaption(memory,startRect,serverRunning?L"停止":L"启动",busy?RGB(160,170,185):RGB(255,255,255));
     DrawCaption(memory,updateRect,updateLabel,busy||serverRunning?RGB(160,170,185):RGB(35,50,76));
     DrawCaption(memory,topRect,topmost?L"关闭置顶":L"开启置顶",RGB(35,50,76));
@@ -1247,13 +1372,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         }
         appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
         SendMessageW(hwnd,WM_SETICON,ICON_SMALL,(LPARAM)appIcon);
-        logEdit = CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
-            0,0,0,0,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
-        logBackground = CreateSolidBrush(RGB(255,255,255));
-        SetWindowSubclass(logEdit, LogEditProc, 1, 0);
-        HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
-        SendMessageW(logEdit,WM_SETFONT,(WPARAM)font,TRUE);
+        logEdit = nullptr;
+        CreateLogEdit(hwnd);
         tooltip = CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP,
             CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
         tipInfo.cbSize=sizeof(tipInfo); tipInfo.uFlags=TTF_SUBCLASS; tipInfo.hwnd=hwnd;
