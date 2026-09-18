@@ -48,6 +48,7 @@ struct ServerIdentity { DWORD pid = 0; unsigned long long created = 0; bool owne
 struct UiRect { int x, y, w, h; bool contains(int px, int py) const { return px >= x && px < x + w && py >= y && py < y + h; } };
 
 static HWND windowHandle, logEdit;
+static HBRUSH logBackground = nullptr;
 static HICON appIcon;
 static std::atomic_bool closing{false};
 static std::mutex processMutex;
@@ -1024,6 +1025,32 @@ static void AppendLog(const std::wstring& line) {
     }
 }
 
+// The log box offers only what makes sense for a read-only log: copy the selection
+// and clear the box. The stock edit menu (cut/paste/undo/select all) is suppressed.
+static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, L"复制");
+    AppendMenuW(menu, MF_STRING, 2, L"清除");
+    DWORD selection = (DWORD)SendMessageW(logEdit, EM_GETSEL, 0, 0);
+    if (HIWORD(selection) == LOWORD(selection)) EnableMenuItem(menu, 1, MF_BYCOMMAND | MF_GRAYED);
+    POINT point{};
+    if (screenPosition == (LPARAM)-1) GetCursorPos(&point);
+    else { point.x = GET_X_LPARAM(screenPosition); point.y = GET_Y_LPARAM(screenPosition); }
+    SetForegroundWindow(windowHandle);
+    int command = (int)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        point.x, point.y, 0, windowHandle, nullptr);
+    DestroyMenu(menu);
+    PostMessageW(windowHandle, WM_NULL, 0, 0);
+    if (command == 1) SendMessageW(logEdit, WM_COPY, 0, 0);
+    else if (command == 2) { logBuffer.clear(); SetWindowTextW(logEdit, L""); }
+}
+
+static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (message == WM_CONTEXTMENU) { ShowLogMenu(hwnd, lp); return 0; }
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+
 static void SetStatus(State state, const std::wstring& detail) {
     status = state;
     std::wstring name = state == State::Running ? L"已启动" : state == State::Stopped ? L"未启动" :
@@ -1211,6 +1238,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         SendMessageW(hwnd,WM_SETICON,ICON_SMALL,(LPARAM)appIcon);
         logEdit = CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
             0,0,0,0,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
+        logBackground = CreateSolidBrush(RGB(255,255,255));
+        SetWindowSubclass(logEdit, LogEditProc, 1, 0);
         HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
         SendMessageW(logEdit,WM_SETFONT,(WPARAM)font,TRUE);
@@ -1230,6 +1259,16 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_PAINT: Paint(); return 0;
     case WM_ERASEBKGND: return 1;
+    // A read-only edit asks through WM_CTLCOLORSTATIC; without this it is filled with
+    // the system face colour instead of the white the rest of the window uses.
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        if ((HWND)lp != logEdit || !logBackground) break;
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, RGB(35, 50, 76));
+        SetBkColor(dc, RGB(255, 255, 255));
+        return (LRESULT)logBackground;
+    }
     case WM_MOUSEMOVE: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
         Button hit=Hit(x,y); if(hit!=hoverButton){hoverButton=hit;InvalidateRect(hwnd,nullptr,FALSE);}
@@ -1315,7 +1354,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
     case WM_DESTROY:
-        closing=true; KillJob(workJob); PostQuitMessage(0); return 0;
+        closing=true; KillJob(workJob);
+        if (logBackground) { DeleteObject(logBackground); logBackground = nullptr; }
+        PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd,message,wp,lp);
 }
@@ -1330,7 +1371,20 @@ static bool ActivateExistingInstance() {
     }
     if (!existing) return false;
     if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
+    // Windows only lets the foreground process hand over the foreground, and a launcher
+    // started from Explorer or a shortcut does not own it: attach to the foreground
+    // thread for the duration of the call, and flip the topmost flag to force a raise.
+    HWND foreground = GetForegroundWindow();
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    bool attached = foregroundThread && foregroundThread != currentThread &&
+        AttachThreadInput(foregroundThread, currentThread, TRUE);
+    bool wasTopmost = (GetWindowLongPtrW(existing, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    SetWindowPos(existing, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (!wasTopmost) SetWindowPos(existing, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     SetForegroundWindow(existing);
+    BringWindowToTop(existing);
+    if (attached) AttachThreadInput(foregroundThread, currentThread, FALSE);
     FLASHWINFO flash{sizeof(flash), existing, FLASHW_ALL, 3, 0};
     FlashWindowEx(&flash);
     return true;
