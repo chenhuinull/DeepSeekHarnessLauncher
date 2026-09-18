@@ -50,6 +50,8 @@ static constexpr int lastButtonRight = topmostX + buttonWidth;
 static constexpr int titleClusterGap = 8, titleButtonWidth = 25, rightMargin = 14;
 static constexpr int titleClusterX = lastButtonRight + titleClusterGap;
 static constexpr int W = titleClusterX + 2 * titleButtonWidth + rightMargin;
+// Folded down to the whale icon and the status lamp; the rest of the chip drags.
+static constexpr int W_MINI = statusX + indicatorWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
 static constexpr int maxLogLines = 50'000;
 static constexpr int trimChunk = 500;
@@ -83,6 +85,7 @@ static ServerIdentity serverIdentity;
 static fs::path runtimeDir;
 static constexpr wchar_t serverJobName[] = L"Local\\DeepSeekHarnessLauncher.Server";
 static bool expanded = false, topmost = true, busy = false, serverRunning = false;
+static bool mini = false;
 static bool systemCorners = false;
 static bool stopping = false, updateAvailable = false, serverExternal = false;
 static std::atomic_bool serverReady{false};
@@ -102,6 +105,8 @@ static const UiRect updateRect{updateX, buttonTop, buttonWidth, buttonHeight};
 static const UiRect topRect{topmostX, buttonTop, buttonWidth, buttonHeight};
 static const UiRect minRect{titleClusterX, buttonTop, titleButtonWidth, buttonHeight};
 static const UiRect closeRect{titleClusterX + titleButtonWidth, buttonTop, titleButtonWidth, buttonHeight};
+// The whale icon doubles as the fold/unfold handle, so it is excluded from dragging.
+static const UiRect iconRect{10, 8, 26, 32};
 
 static std::wstring Utf8(const std::string& s) {
     if (s.empty()) return {};
@@ -1342,14 +1347,15 @@ static void SetStatus(State state, const std::wstring& detail) {
 static int Scaled(int n) { return (int)(n * scaleFactor + .5f); }
 static void Layout() {
     if (!windowHandle) return;
-    int width = Scaled(W), height = Scaled(expanded ? H_EXPANDED : H_COLLAPSED);
+    int width = Scaled(mini ? W_MINI : W);
+    int height = Scaled(mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED));
     SetWindowPos(windowHandle, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     if (!systemCorners)
         SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height, Scaled(12), Scaled(12)), TRUE);
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(20), Scaled(53), Scaled(W - 40), Scaled(157), SWP_NOZORDER | SWP_NOACTIVATE);
-        ShowWindow(logEdit, expanded ? SW_SHOW : SW_HIDE);
-        if (expanded) SetTimer(windowHandle, logHoverTimer, logHoverIntervalMs, nullptr);
+        ShowWindow(logEdit, (expanded && !mini) ? SW_SHOW : SW_HIDE);
+        if (expanded && !mini) SetTimer(windowHandle, logHoverTimer, logHoverIntervalMs, nullptr);
         else {
             KillTimer(windowHandle, logHoverTimer);
             logHovered = false;
@@ -1360,7 +1366,17 @@ static void Layout() {
 }
 
 static void ExpandLog(bool value) { if (expanded == value) return; expanded = value; Layout(); }
+static void ToggleMini() {
+    mini = !mini;
+    if (mini) ExpandLog(false);
+    Layout();
+    // the log is hidden while folded, so a stale hover state must not keep the bar alive
+    if (mini) { logHovered = false; UpdateLogScrollBar(); }
+    AppendLog(mini ? L"已折叠为图标模式，双击鲸鱼图标可展开。"
+                   : L"已展开全部按钮。");
+}
 static Button Hit(int x, int y) {
+    if (mini) return Button::None;   // folded: the whole chip drags, the icon toggles
     if (logRect.contains(x,y)) return Button::Log;
     if (statusRect.contains(x,y)) return Button::Status;
     if (startRect.contains(x,y)) return Button::Start;
@@ -1413,15 +1429,17 @@ static void Paint() {
     HGDIOBJ old = SelectObject(memory, bitmap);
     Graphics g(memory); g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
     g.ScaleTransform(scaleFactor, scaleFactor);
-    int h = expanded ? H_EXPANDED : H_COLLAPSED;
-    SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, W, h);
+    int width = mini ? W_MINI : W;
+    int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
+    SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, width, h);
     if (!systemCorners) {
-        GraphicsPath frame; Rounded(frame,1.f,1.f,W-2.f,h-2.f,6);
+        GraphicsPath frame; Rounded(frame,1.f,1.f,width-2.f,h-2.f,6);
         Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
     }
     DrawButton(g,statusRect,L"",Button::Status);
     SolidBrush dot(ColorForStatus());
     g.FillEllipse(&dot,statusRect.x + (indicatorWidth - 10) / 2,buttonTop + (buttonHeight - 10) / 2,10,10);
+    if (!mini) {
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,logRect,L"日志",Button::Log);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
@@ -1440,12 +1458,14 @@ static void Paint() {
     Pen cross(Color(185,28,28),1.8f);
     g.DrawLine(&cross,closeRect.x + 8,19,closeRect.x + 16,29);
     g.DrawLine(&cross,closeRect.x + 16,19,closeRect.x + 8,29);
-    if (expanded) {
+    }   // end of the buttons-only block
+    if (expanded && !mini) {
         GraphicsPath logBox; Rounded(logBox,14.5f,48.5f,(float)(W - 29),165,controlCornerRadius); Pen logBorder(Color(221,228,238),1);
         g.DrawPath(&logBorder,&logBox);
     }
     g.Flush();
     if (appIcon) DrawIconEx(memory, Scaled(12), Scaled(13), appIcon, Scaled(22), Scaled(22), 0, nullptr, DI_NORMAL);
+    if (!mini) {
     HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
     HGDIOBJ previousFont = SelectObject(memory,font);
@@ -1454,6 +1474,7 @@ static void Paint() {
     DrawCaption(memory,updateRect,updateLabel,busy||serverRunning?RGB(160,170,185):RGB(35,50,76));
     DrawCaption(memory,topRect,topmost?L"关闭置顶":L"开启置顶",RGB(35,50,76));
     SelectObject(memory,previousFont); DeleteObject(font);
+    }
     BitBlt(hdc,0,0,client.right,client.bottom,memory,0,0,SRCCOPY);
     SelectObject(memory,old); DeleteObject(bitmap); DeleteDC(memory); EndPaint(windowHandle,&ps);
 }
@@ -1502,6 +1523,15 @@ static void OnClick(Button button) {
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_NCCALCSIZE: if (wp) return 0; break;
+    case WM_GETMINMAXINFO: {
+        // A window with a caption and a thick frame may not shrink below the system's
+        // minimum tracking size (about 136 px wide), which would keep the folded chip
+        // wider than the icon and the lamp. Declare our own minimum instead.
+        MINMAXINFO* limits = (MINMAXINFO*)lp;
+        limits->ptMinTrackSize.x = Scaled(W_MINI);
+        limits->ptMinTrackSize.y = Scaled(H_COLLAPSED);
+        return 0;
+    }
     case WM_NCHITTEST: return HTCLIENT;
     case WM_CREATE: {
         windowHandle = hwnd;
@@ -1554,8 +1584,16 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_LBUTTONDOWN: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
         Button hit=Hit(x,y);
-        if(hit==Button::None && y<50) { ReleaseCapture(); SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0); }
-        else OnClick(hit);
+        // The whale icon is the fold/unfold handle, so a click there never starts a drag:
+        // otherwise the move loop would swallow the second click of a double click.
+        if(iconRect.contains(x,y)) return 0;
+        if(hit==Button::None && y<(mini ? H_COLLAPSED : 50)) { ReleaseCapture(); SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0); }
+        else if(hit!=Button::None) OnClick(hit);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: {
+        int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
+        if(iconRect.contains(x,y)) ToggleMini();
         return 0;
     }
     case WM_TIMER:
@@ -1700,13 +1738,17 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
     HDC dc=GetDC(nullptr); scaleFactor=(float)GetDeviceCaps(dc,LOGPIXELSX)/96.f; ReleaseDC(nullptr,dc);
     WNDCLASSW wc{}; wc.lpfnWndProc=WindowProc; wc.hInstance=instance;
     wc.lpszClassName=L"DeepSeekHarnessLauncherNative"; wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+    wc.style=CS_DBLCLKS;   // needed for WM_LBUTTONDBLCLK on the whale icon
     wc.hIcon=(HICON)LoadImageW(instance,MAKEINTRESOURCEW(1),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
     RegisterClassW(&wc);
     RECT area{}; SystemParametersInfoW(SPI_GETWORKAREA,0,&area,0);
     int width=Scaled(W),height=Scaled(H_COLLAPSED);
     int x=area.left+(area.right-area.left-width)/2,y=area.top+(area.bottom-area.top-height)/2;
+    // No WS_CAPTION / WS_THICKFRAME: the non-client area is removed anyway, and a caption
+    // or thick frame would make the system refuse to shrink the folded chip below its
+    // minimum tracking size (~136 px), which is wider than the icon and the lamp.
     HWND hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_APPWINDOW,wc.lpszClassName,L"DeepSeek Harness 启动器",
-        WS_POPUP|WS_CAPTION|WS_THICKFRAME|WS_SYSMENU|WS_MINIMIZEBOX,x,y,width,height,nullptr,nullptr,instance,nullptr);
+        WS_POPUP|WS_SYSMENU|WS_MINIMIZEBOX,x,y,width,height,nullptr,nullptr,instance,nullptr);
     if(!hwnd) return 1;
     SetWindowPos(hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
     ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
