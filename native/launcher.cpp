@@ -1525,7 +1525,10 @@ static void DrawButton(Graphics& g, const UiRect& r, const std::wstring& label, 
 }
 
 static void DrawCaption(HDC dc, const UiRect& r, const std::wstring& text, COLORREF color) {
-    RECT bounds{Scaled(r.x), Scaled(r.y), Scaled(r.x + r.w), Scaled(r.y + r.h)};
+    // DT_VCENTER centres the font's line box, which reserves descender space that CJK-only
+    // text never uses, so the ink sits one pixel above the middle of the button — visible
+    // next to the status lamp, which is centred geometrically. Nudge the box down by one.
+    RECT bounds{Scaled(r.x), Scaled(r.y) + Scaled(1), Scaled(r.x + r.w), Scaled(r.y + r.h) + Scaled(1)};
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, color);
     DrawTextW(dc, text.c_str(), -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
