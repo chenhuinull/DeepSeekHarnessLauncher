@@ -31,6 +31,8 @@ static constexpr UINT WM_SERVER_READY = WM_APP + 4;
 static constexpr UINT WM_SERVER_EXIT = WM_APP + 5;
 static constexpr UINT WM_SERVER_ADOPTED = WM_APP + 6;
 static constexpr UINT WM_DOWNLOAD = WM_APP + 7;
+static constexpr UINT WM_SERVER_UNHEALTHY = WM_APP + 8;
+static constexpr UINT WM_SERVER_HEALTHY = WM_APP + 9;
 static constexpr int H_COLLAPSED = 48, H_EXPANDED = 228;
 // The whole button row is derived from these numbers, so the window width follows the
 // button width instead of being a separate constant.
@@ -38,10 +40,10 @@ static constexpr int buttonWidth = 60, buttonHeight = 28, buttonTop = 10, button
 // The status control is a lamp only, so it stays as narrow as a square indicator.
 static constexpr int indicatorWidth = 28;
 static constexpr int firstButtonX = 42;
-static constexpr int logX = firstButtonX;
-static constexpr int statusX = logX + buttonWidth + buttonGap;
+static constexpr int statusX = firstButtonX;
 static constexpr int startX = statusX + indicatorWidth + buttonGap;
-static constexpr int updateX = startX + buttonWidth + buttonGap;
+static constexpr int logX = startX + buttonWidth + buttonGap;
+static constexpr int updateX = logX + buttonWidth + buttonGap;
 static constexpr int topmostX = updateX + buttonWidth + buttonGap;
 static constexpr int lastButtonRight = topmostX + buttonWidth;
 static constexpr int titleClusterGap = 8, titleButtonWidth = 25, rightMargin = 14;
@@ -53,13 +55,17 @@ static constexpr int trimChunk = 500;
 static constexpr UINT_PTR logHoverTimer = 1;
 static constexpr UINT logHoverIntervalMs = 120;
 static constexpr DWORD readyProbeIntervalMs = 1'000;
+// After the service is up, keep asking the port whether it still answers: a process can
+// stay alive while the web server inside it is gone.
+static constexpr DWORD healthProbeIntervalMs = 5'000;
+static constexpr int healthFailureThreshold = 3;
 static constexpr float controlCornerRadius = 4.0f;   // buttons and the log box share this
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
 // Versions this build is known to work with. Downloads stay reproducible and a
 // newer dsh is only installed when the user asks for it.
 static constexpr wchar_t pinnedNodeVersion[] = L"24.16.0";
 static constexpr wchar_t pinnedDshVersion[] = L"0.1.5-rc.2";
-enum class State { Running, Stopped, Missing, Update };
+enum class State { Running, Stopped, Missing, Update, Unresponsive };
 enum class Work { Start, Check, InstallUpdate, Rollback };
 enum class Button { None, Log, Status, Start, Update, Topmost, Minimize, Close };
 struct Result { Work work; bool ok; std::wstring message; std::wstring version; std::wstring info; bool installed; bool update; };
@@ -794,6 +800,9 @@ static DWORD MonitorServer(HANDLE process, HANDLE job, ServerIdentity id, bool a
     std::string pending;
     bool exited = false;
     ULONGLONG nextProbe = GetTickCount64() + readyProbeIntervalMs;
+    ULONGLONG nextHealth = GetTickCount64() + healthProbeIntervalMs;
+    int healthFailures = 0;
+    bool unhealthy = false;
     while (!closing) {
         ReadServerLog(offset, pending);
         // The log line is the fast path; probing the port keeps "ready" working
@@ -803,6 +812,21 @@ static DWORD MonitorServer(HANDLE process, HANDLE job, ServerIdentity id, bool a
             if (ProbeHarness(serverPort)) {
                 serverReady = true;
                 if (!closing) PostMessageW(windowHandle, WM_SERVER_READY, 0, 0);
+            }
+        } else if (serverReady && GetTickCount64() >= nextHealth) {
+            // The process handle says nothing about the web server inside it, so keep
+            // asking the port and report when it stops answering.
+            nextHealth = GetTickCount64() + healthProbeIntervalMs;
+            if (ProbeHarness(serverPort)) {
+                healthFailures = 0;
+                if (unhealthy) {
+                    unhealthy = false;
+                    if (!closing) PostMessageW(windowHandle, WM_SERVER_HEALTHY, 0, 0);
+                }
+            } else if (++healthFailures >= healthFailureThreshold && !unhealthy) {
+                unhealthy = true;
+                bool listening = PortOwnerPid(serverPort) != 0;
+                if (!closing) PostMessageW(windowHandle, WM_SERVER_UNHEALTHY, listening ? 1 : 0, 0);
             }
         }
         if (WaitForSingleObject(process, 250) == WAIT_OBJECT_0) { exited = true; break; }
@@ -1198,7 +1222,8 @@ static void CreateLogEdit(HWND parent) {
 static void SetStatus(State state, const std::wstring& detail) {
     status = state;
     std::wstring name = state == State::Running ? L"已启动" : state == State::Stopped ? L"未启动" :
-        state == State::Update ? L"未启动，有更新" : L"未安装固件";
+        state == State::Update ? L"未启动，有更新" :
+        state == State::Unresponsive ? L"已启动，服务无响应" : L"未安装固件";
     statusTip = name + L" · " + detail;
     if (tooltip) { tipInfo.lpszText = statusTip.data(); SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&tipInfo); }
     InvalidateRect(windowHandle, nullptr, FALSE);
@@ -1241,6 +1266,8 @@ static Color ColorForStatus() {
     case State::Running: return Color(34,197,94);
     case State::Stopped: return Color(234,179,8);
     case State::Update: return Color(168,85,247);
+    // Amber, not the yellow of "not started": the process is up, the service is not.
+    case State::Unresponsive: return Color(249,115,22);
     default: return Color(239,68,68);
     }
 }
@@ -1282,11 +1309,11 @@ static void Paint() {
         GraphicsPath frame; Rounded(frame,1.f,1.f,W-2.f,h-2.f,6);
         Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
     }
-    DrawButton(g,logRect,L"日志",Button::Log);
     DrawButton(g,statusRect,L"",Button::Status);
     SolidBrush dot(ColorForStatus());
     g.FillEllipse(&dot,statusRect.x + (indicatorWidth - 10) / 2,buttonTop + (buttonHeight - 10) / 2,10,10);
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
+    DrawButton(g,logRect,L"日志",Button::Log);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
     DrawButton(g,topRect,topmost ? L"关闭置顶" : L"开启置顶",Button::Topmost);
     GraphicsPath titlePath; Rounded(titlePath,titleClusterX + .5f,10.5f,49,27,controlCornerRadius); SolidBrush pale(Color(248,250,252));
@@ -1487,6 +1514,19 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         rollbackVersion.clear(); updateLabel=L"检查更新";
         SetStatus(State::Running,L"Web 服务已就绪；浏览器将自动打开，访问地址见运行日志。");
         ExpandLog(false); return 0;
+    case WM_SERVER_UNHEALTHY:
+        if (!serverRunning) return 0;
+        SetStatus(State::Unresponsive, wp
+            ? L"端口 "+std::to_wstring((int)serverPort)+L" 仍有监听，但连续 "+std::to_wstring(healthFailureThreshold)+L" 次探测都没有应答。"
+            : L"端口 "+std::to_wstring((int)serverPort)+L" 已无监听；进程还在，但 Web 服务已经不在了。");
+        AppendLog(wp ? L"Web 服务无响应（端口仍有监听，但没有应答），状态灯已变为橙色。"
+                    : L"Web 服务已停止监听（端口无监听，进程仍在），状态灯已变为橙色。");
+        return 0;
+    case WM_SERVER_HEALTHY:
+        if (!serverRunning || status != State::Unresponsive) return 0;
+        SetStatus(State::Running, L"Web 服务已恢复响应。");
+        AppendLog(L"Web 服务已恢复响应，状态灯已变回绿色。");
+        return 0;
     case WM_SERVER_EXIT: {
         if (!serverRunning && !busy) return 0;
         bool failed=!stopping&&!serverReady;
