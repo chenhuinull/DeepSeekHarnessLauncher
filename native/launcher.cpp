@@ -1381,15 +1381,6 @@ static void RemoveTrayIcon() {
     Shell_NotifyIconW(NIM_DELETE, &trayIconData);
 }
 
-static void ShowTrayBalloon(const std::wstring& title, const std::wstring& text) {
-    if (!trayIconAdded) return;
-    wcsncpy_s(trayIconData.szInfoTitle, title.c_str(), _TRUNCATE);
-    wcsncpy_s(trayIconData.szInfo, text.c_str(), _TRUNCATE);
-    trayIconData.dwInfoFlags = NIIF_INFO;
-    trayIconData.uFlags = NIF_INFO;
-    Shell_NotifyIconW(NIM_MODIFY, &trayIconData);
-}
-
 static void ShowLauncherWindow() {
     if (IsIconic(windowHandle)) ShowWindow(windowHandle, SW_RESTORE);
     ShowWindow(windowHandle, SW_SHOW);
@@ -1673,6 +1664,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if (attached) {
             AppendLog(L"检测到已运行的 DeepSeek Harness，可以点击“停止”结束服务。");
             OpenBrowserIfNoPage();
+        } else {
+            // No service to take over: open straight into a running harness.
+            AppendLog(L"未检测到运行中的服务，自动启动 DeepSeek Harness。");
+            BeginWork(Work::Start);
         }
         return 0;
     }
@@ -1875,11 +1870,10 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
         WS_POPUP|WS_SYSMENU|WS_MINIMIZEBOX,x,y,width,height,nullptr,nullptr,instance,nullptr);
     if(!hwnd) return 1;
     SetWindowPos(hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
-    // Starts in the tray: the window stays hidden until the icon is clicked. The balloon
-    // is the only hint that it is running, since there is no taskbar button either.
+    // Shown by default; the tray icon is still there for "hide to tray" and the menu.
     taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     AddTrayIcon();
-    ShowTrayBalloon(L"DeepSeek Harness 启动器", L"已在托盘运行。点击托盘图标打开窗口，右键显示菜单。");
+    ShowWindow(hwnd,SW_SHOW);
     UpdateWindow(hwnd);
     MSG message;
     while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}
