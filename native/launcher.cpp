@@ -31,7 +31,15 @@ static constexpr UINT WM_SERVER_READY = WM_APP + 4;
 static constexpr UINT WM_SERVER_EXIT = WM_APP + 5;
 static constexpr UINT WM_SERVER_ADOPTED = WM_APP + 6;
 static constexpr UINT WM_DOWNLOAD = WM_APP + 7;
-static constexpr int W = 470, H_COLLAPSED = 48, H_EXPANDED = 228;
+static constexpr int H_COLLAPSED = 48, H_EXPANDED = 228;
+// The whole button row is derived from these numbers, so the window width follows the
+// button width instead of being a separate constant.
+static constexpr int buttonWidth = 60, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
+static constexpr int firstButtonX = 42, buttonCount = 5;
+static constexpr int titleClusterGap = 8, titleButtonWidth = 25, rightMargin = 14;
+static constexpr int lastButtonRight = firstButtonX + buttonCount * buttonWidth + (buttonCount - 1) * buttonGap;
+static constexpr int titleClusterX = lastButtonRight + titleClusterGap;
+static constexpr int W = titleClusterX + 2 * titleButtonWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
 static constexpr DWORD readyProbeIntervalMs = 1'000;
 static constexpr float buttonCornerRadius = 4.5f;
@@ -67,13 +75,13 @@ static HWND tooltip;
 static TOOLINFOW tipInfo{};
 static float scaleFactor = 1.0f;
 
-static const UiRect logRect{42, 10, 68, 28};
-static const UiRect statusRect{114, 10, 68, 28};
-static const UiRect startRect{186, 10, 68, 28};
-static const UiRect updateRect{258, 10, 68, 28};
-static const UiRect topRect{330, 10, 68, 28};
-static const UiRect minRect{406, 10, 25, 28};
-static const UiRect closeRect{431, 10, 25, 28};
+static const UiRect logRect{firstButtonX, buttonTop, buttonWidth, buttonHeight};
+static const UiRect statusRect{firstButtonX + buttonWidth + buttonGap, buttonTop, buttonWidth, buttonHeight};
+static const UiRect startRect{firstButtonX + 2 * (buttonWidth + buttonGap), buttonTop, buttonWidth, buttonHeight};
+static const UiRect updateRect{firstButtonX + 3 * (buttonWidth + buttonGap), buttonTop, buttonWidth, buttonHeight};
+static const UiRect topRect{firstButtonX + 4 * (buttonWidth + buttonGap), buttonTop, buttonWidth, buttonHeight};
+static const UiRect minRect{titleClusterX, buttonTop, titleButtonWidth, buttonHeight};
+static const UiRect closeRect{titleClusterX + titleButtonWidth, buttonTop, titleButtonWidth, buttonHeight};
 
 static std::wstring Utf8(const std::string& s) {
     if (s.empty()) return {};
@@ -1068,7 +1076,7 @@ static void Layout() {
     if (!systemCorners)
         SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height, Scaled(12), Scaled(12)), TRUE);
     if (logEdit) {
-        SetWindowPos(logEdit, nullptr, Scaled(20), Scaled(53), Scaled(430), Scaled(157), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(logEdit, nullptr, Scaled(20), Scaled(53), Scaled(W - 40), Scaled(157), SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(logEdit, expanded ? SW_SHOW : SW_HIDE);
     }
     InvalidateRect(windowHandle, nullptr, TRUE);
@@ -1134,23 +1142,26 @@ static void Paint() {
     }
     DrawButton(g,logRect,L"日志",Button::Log);
     DrawButton(g,statusRect,L"状态",Button::Status);
-    SolidBrush dot(ColorForStatus()); g.FillEllipse(&dot,126,19,10,10);
+    SolidBrush dot(ColorForStatus()); g.FillEllipse(&dot,statusRect.x + 12,19,10,10);
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
     DrawButton(g,topRect,topmost ? L"关闭置顶" : L"开启置顶",Button::Topmost);
-    GraphicsPath titlePath; Rounded(titlePath,406.5f,10.5f,49,27,buttonCornerRadius); SolidBrush pale(Color(248,250,252));
+    GraphicsPath titlePath; Rounded(titlePath,titleClusterX + .5f,10.5f,49,27,buttonCornerRadius); SolidBrush pale(Color(248,250,252));
     Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
         GraphicsState saved = g.Save(); g.SetClip(&titlePath);
-        SolidBrush hl(Color(236,242,249)); g.FillRectangle(&hl,hoverButton == Button::Minimize ? 407 : 431,11,24,26);
+        SolidBrush hl(Color(236,242,249));
+        g.FillRectangle(&hl,hoverButton == Button::Minimize ? minRect.x + 1 : closeRect.x + 1,11,24,26);
         g.Restore(saved);
     }
     g.DrawPath(&light,&titlePath);
-    Pen divider(Color(226,232,240),1); g.DrawLine(&divider,431,16,431,32);
-    Pen dash(Color(71,85,105),1.8f); g.DrawLine(&dash,414,25,423,25);
-    Pen cross(Color(185,28,28),1.8f); g.DrawLine(&cross,439,19,447,29); g.DrawLine(&cross,447,19,439,29);
+    Pen divider(Color(226,232,240),1); g.DrawLine(&divider,closeRect.x,16,closeRect.x,32);
+    Pen dash(Color(71,85,105),1.8f); g.DrawLine(&dash,minRect.x + 8,25,minRect.x + 17,25);
+    Pen cross(Color(185,28,28),1.8f);
+    g.DrawLine(&cross,closeRect.x + 8,19,closeRect.x + 16,29);
+    g.DrawLine(&cross,closeRect.x + 16,19,closeRect.x + 8,29);
     if (expanded) {
-        GraphicsPath logBox; Rounded(logBox,14.5f,48.5f,441,165,7); Pen logBorder(Color(221,228,238),1);
+        GraphicsPath logBox; Rounded(logBox,14.5f,48.5f,(float)(W - 29),165,7); Pen logBorder(Color(221,228,238),1);
         g.DrawPath(&logBorder,&logBox);
     }
     g.Flush();
@@ -1246,7 +1257,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         tooltip = CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP,
             CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
         tipInfo.cbSize=sizeof(tipInfo); tipInfo.uFlags=TTF_SUBCLASS; tipInfo.hwnd=hwnd;
-        tipInfo.uId=1; tipInfo.rect={Scaled(114),Scaled(10),Scaled(182),Scaled(38)};
+        tipInfo.uId=1;
+        tipInfo.rect={Scaled(statusRect.x),Scaled(buttonTop),Scaled(statusRect.x + buttonWidth),Scaled(buttonTop + buttonHeight)};
         tipInfo.lpszText=statusTip.data(); SendMessageW(tooltip,TTM_ADDTOOLW,0,(LPARAM)&tipInfo);
         Layout();
         bool attached = AttachRunningServer() || AdoptRunningService();
@@ -1341,10 +1353,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         serverRunning=false; busy=false; serverReady=false; serverExternal=false;
         std::wstring known=KnownGoodVersion();
         if(failed&&!known.empty()&&known!=Version()) {
-            rollbackVersion=known; updateAvailable=false; updateLabel=L"回退到 "+known;
+            rollbackVersion=known; updateAvailable=false; updateLabel=L"回退版本";
         }
         State stoppedState=updateAvailable?State::Update:(Installed()?State::Stopped:State::Missing);
-        SetStatus(stoppedState,failed?L"服务未能启动，请查看日志。":L"Web 服务已停止。");
+        SetStatus(stoppedState, failed
+            ? (rollbackVersion.empty()?L"服务未能启动，请查看日志。":L"服务未能启动；可回退到 "+rollbackVersion+L"。")
+            : L"Web 服务已停止。");
         AppendLog(failed?L"启动失败，服务退出代码 "+std::to_wstring((DWORD)wp)+L"。":
             (stopping?L"Web 服务已停止。":L"Web 服务已退出，代码 "+std::to_wstring((DWORD)wp)+L"。"));
         if(failed&&!rollbackVersion.empty())
