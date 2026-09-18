@@ -37,7 +37,7 @@ static constexpr UINT WM_SERVER_HEALTHY = WM_APP + 9;
 static constexpr int H_COLLAPSED = 48, H_EXPANDED = 228;
 // The whole button row is derived from these numbers, so the window width follows the
 // button width instead of being a separate constant.
-static constexpr int buttonWidth = 60, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
+static constexpr int buttonWidth = 46, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
 // The status control is a lamp only, so it stays as narrow as a square indicator.
 static constexpr int indicatorWidth = 28;
 static constexpr int firstButtonX = 42;
@@ -91,7 +91,7 @@ static bool stopping = false, updateAvailable = false, serverExternal = false;
 static std::atomic_bool serverReady{false};
 static State status = State::Missing;
 static Button hoverButton = Button::None;
-static std::wstring statusTip = L"未安装固件", updateLabel = L"检查更新", rollbackVersion;
+static std::wstring statusTip = L"未安装固件", updateLabel = L"更新", rollbackVersion;
 static int logLineCount = 0;
 static bool logHovered = false, logScrollBarShown = false;
 static HWND tooltip;
@@ -1485,13 +1485,41 @@ static void Rounded(GraphicsPath& p, float x, float y, float w, float h, float r
     p.CloseFigure();
 }
 
+// Buttons carry their state in the background instead of in a longer label: 置顶 is tinted
+// while it is on, 更新 turns violet when a new version is ready and amber when the last
+// version can be restored.
+enum class Tone { Plain, Accent, Update, Rollback };
+
+static void ToneColors(Tone tone, Color& background, Color& border, Color& text, bool hovered) {
+    switch (tone) {
+    case Tone::Accent:
+        background = hovered ? Color(191,219,254) : Color(219,234,254);
+        border = Color(147,197,253); text = Color(30,64,175); break;
+    case Tone::Update:
+        background = hovered ? Color(221,214,254) : Color(237,233,254);
+        border = Color(196,181,253); text = Color(109,40,217); break;
+    case Tone::Rollback:
+        background = hovered ? Color(254,215,170) : Color(255,237,213);
+        border = Color(253,186,116); text = Color(194,65,12); break;
+    default:
+        background = hovered ? Color(239,246,255) : Color(255,255,255);
+        border = Color(203,213,225); text = Color(35,50,76); break;
+    }
+}
+
+static Tone UpdateTone() {
+    if (!rollbackVersion.empty()) return Tone::Rollback;
+    return updateAvailable ? Tone::Update : Tone::Plain;
+}
+
 static void DrawButton(Graphics& g, const UiRect& r, const std::wstring& label, Button button,
-    bool primary = false, bool disabled = false) {
+    bool primary = false, bool disabled = false, Tone tone = Tone::Plain) {
     Color bg = primary ? Color(37,99,235) : Color(255,255,255);
     Color border = primary ? Color(37,99,235) : Color(203,213,225);
     Color fg = primary ? Color(255,255,255) : Color(35,50,76);
+    if (!primary) ToneColors(tone, bg, border, fg, hoverButton == button);
     if (disabled) { bg = Color(248,250,252); fg = Color(160,170,185); border = Color(221,228,238); }
-    else if (hoverButton == button) { bg = primary ? Color(29,78,216) : Color(239,246,255); }
+    else if (primary && hoverButton == button) { bg = Color(29,78,216); }
     GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, controlCornerRadius);
     SolidBrush fill(bg); Pen edge(border, 1); g.FillPath(&fill, &path); g.DrawPath(&edge, &path);
 }
@@ -1522,8 +1550,8 @@ static void Paint() {
     if (!mini) {
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,logRect,L"日志",Button::Log);
-    DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
-    DrawButton(g,topRect,topmost ? L"关闭置顶" : L"开启置顶",Button::Topmost);
+    DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning, UpdateTone());
+    DrawButton(g,topRect,L"置顶",Button::Topmost,false,false,topmost ? Tone::Accent : Tone::Plain);
     GraphicsPath titlePath; Rounded(titlePath,titleClusterX + .5f,10.5f,49,27,controlCornerRadius); SolidBrush pale(Color(248,250,252));
     Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
@@ -1551,8 +1579,12 @@ static void Paint() {
     HGDIOBJ previousFont = SelectObject(memory,font);
     DrawCaption(memory,logRect,L"日志",RGB(35,50,76));
     DrawCaption(memory,startRect,serverRunning?L"停止":L"启动",busy?RGB(160,170,185):RGB(255,255,255));
-    DrawCaption(memory,updateRect,updateLabel,busy||serverRunning?RGB(160,170,185):RGB(35,50,76));
-    DrawCaption(memory,topRect,topmost?L"关闭置顶":L"开启置顶",RGB(35,50,76));
+    Color updateBg, updateBorder, updateText;
+    ToneColors(UpdateTone(), updateBg, updateBorder, updateText, false);
+    DrawCaption(memory,updateRect,updateLabel,busy||serverRunning?RGB(160,170,185):RGB(updateText.GetR(),updateText.GetG(),updateText.GetB()));
+    Color topBg, topBorder, topText;
+    ToneColors(topmost ? Tone::Accent : Tone::Plain, topBg, topBorder, topText, false);
+    DrawCaption(memory,topRect,L"置顶",RGB(topText.GetR(),topText.GetG(),topText.GetB()));
     SelectObject(memory,previousFont); DeleteObject(font);
     }
     BitBlt(hdc,0,0,client.right,client.bottom,memory,0,0,SRCCOPY);
@@ -1717,22 +1749,22 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             AppendLog(r->info);
             SetStatus(Installed()?State::Stopped:State::Missing,r->info);
         } else if(r->work==Work::Start) {
-            updateAvailable=false; updateLabel=L"检查更新"; rollbackVersion.clear();
+            updateAvailable=false; updateLabel=L"更新"; rollbackVersion.clear();
             SetStatus(State::Stopped,L"正在等待 Web 服务就绪…");
         } else if(r->work==Work::InstallUpdate) {
-            updateAvailable=false; updateLabel=L"检查更新"; rollbackVersion.clear();
+            updateAvailable=false; updateLabel=L"更新"; rollbackVersion.clear();
             AppendLog(L"更新完成，版本 "+r->version+L"。");
             SetStatus(State::Stopped,L"已安装版本 "+r->version+L"。");
         } else if(r->work==Work::Rollback) {
-            updateAvailable=false; updateLabel=L"检查更新"; rollbackVersion.clear();
+            updateAvailable=false; updateLabel=L"更新"; rollbackVersion.clear();
             AppendLog(L"已回退到版本 "+r->version+L"。");
             SetStatus(State::Stopped,L"已回退到版本 "+r->version+L"。");
         } else if(!r->installed) {
             AppendLog(L"最新版本 "+r->version+L"；本机尚未安装，点击“启动”即可安装。");
             SetStatus(State::Missing,L"npm 最新版本 "+r->version+L"。启动时会自动安装。");
         } else if(r->update) {
-            updateAvailable=true; updateLabel=L"安装更新"; rollbackVersion.clear();
-            AppendLog(L"发现新版本："+Version()+L" → "+r->version+L"。再次点击“安装更新”执行更新。");
+            updateAvailable=true; updateLabel=L"更新"; rollbackVersion.clear();
+            AppendLog(L"发现新版本："+Version()+L" → "+r->version+L"。“更新”按钮已变为紫色，点击即可安装。");
             SetStatus(State::Update,L"当前 "+Version()+L"，npm 最新 "+r->version+L"。");
         } else {
             AppendLog(L"已是最新版本："+r->version+L"。");
@@ -1752,7 +1784,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_SERVER_READY:
         serverReady=true;
         if(!serverExternal) SaveKnownGoodVersion(Version());
-        rollbackVersion.clear(); updateLabel=L"检查更新";
+        rollbackVersion.clear(); updateLabel=L"更新";
         SetStatus(State::Running,L"Web 服务已就绪；访问地址见运行日志。");
         OpenBrowserIfNoPage();
         ExpandLog(false); return 0;
@@ -1775,7 +1807,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         serverRunning=false; busy=false; serverReady=false; serverExternal=false;
         std::wstring known=KnownGoodVersion();
         if(failed&&!known.empty()&&known!=Version()) {
-            rollbackVersion=known; updateAvailable=false; updateLabel=L"回退版本";
+            rollbackVersion=known; updateAvailable=false; updateLabel=L"回退";
         }
         State stoppedState=updateAvailable?State::Update:(Installed()?State::Stopped:State::Missing);
         SetStatus(stoppedState, failed
@@ -1784,7 +1816,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         AppendLog(failed?L"启动失败，服务退出代码 "+std::to_wstring((DWORD)wp)+L"。":
             (stopping?L"Web 服务已停止。":L"Web 服务已退出，代码 "+std::to_wstring((DWORD)wp)+L"。"));
         if(failed&&!rollbackVersion.empty())
-            AppendLog(L"上次可用版本是 "+rollbackVersion+L"，可点击“回退到 "+rollbackVersion+L"”恢复。");
+            AppendLog(L"上次可用版本是 "+rollbackVersion+L"，“更新”按钮已变为橙色，点击即可回退。");
         if(failed) ExpandLog(true);
         stopping=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
     }
