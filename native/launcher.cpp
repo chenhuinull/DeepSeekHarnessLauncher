@@ -1763,7 +1763,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
     // No WS_CAPTION / WS_THICKFRAME: the non-client area is removed anyway, and a caption
     // or thick frame would make the system refuse to shrink the folded chip below its
     // minimum tracking size (~136 px), which is wider than the icon and the lamp.
-    HWND hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_APPWINDOW,wc.lpszClassName,L"DeepSeek Harness 启动器",
+    // WS_EX_TOOLWINDOW keeps this floating widget out of the taskbar and out of the
+    // Alt+Tab list; a tool window is still restored by launching the exe again.
+    HWND hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,wc.lpszClassName,L"DeepSeek Harness 启动器",
         WS_POPUP|WS_SYSMENU|WS_MINIMIZEBOX,x,y,width,height,nullptr,nullptr,instance,nullptr);
     if(!hwnd) return 1;
     SetWindowPos(hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
