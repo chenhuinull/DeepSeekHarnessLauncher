@@ -317,11 +317,27 @@ static void CheckLogBarCovers() {
     SendMessageW(logEdit, EM_LINESCROLL, -100000, 0);
     Pump();
     SyncLogHorizontalOffset();
+
+    // Overflow alone is not enough any more: the bars belong to the reader's attention, so with the
+    // pointer elsewhere and nothing selected they paint nothing.
+    logHovered = false;
+    logSelected = false;
+    repaint(logVerticalBar, SB_VERT);
+    PaintedBar quietVertical = ReadPaintedBar(memory, verticalBox, true);
+    repaint(logHorizontalBar, SB_HORZ);
+    PaintedBar quietHorizontal = ReadPaintedBar(memory, horizontalBox, false);
+    Check(!quietVertical.any() && !quietHorizontal.any(),
+        "overflowing content on its own shows no line: the bars wait for a hover or a selection");
+
+    // Selecting the log is one of the two things that brings them out.
+    SendMessageW(logEdit, EM_SETSEL, 0, (LPARAM)-1);
+    RefreshLogBars();
+    Check(logSelected, "a selection is noticed");
     repaint(logVerticalBar, SB_VERT);
     PaintedBar verticalLine = ReadPaintedBar(memory, verticalBox, true);
     repaint(logHorizontalBar, SB_HORZ);
     PaintedBar horizontalLine = ReadPaintedBar(memory, horizontalBox, false);
-    Check(verticalLine.any() && horizontalLine.any(), "overflowing content paints one line per bar");
+    Check(verticalLine.any() && horizontalLine.any(), "with a selection each bar paints its line");
     Check(verticalLine.runs == 1 && horizontalLine.runs == 1,
         "each cover holds a single line: no track, no arrow buttons, no end caps");
     int wanted = Scaled(logBarThickness);
@@ -354,10 +370,14 @@ static void CheckLogBarCovers() {
     Check(shorter.any() && shorter.length() > verticalLine.length(),
         "a shorter log draws a longer line, following the visible share of the content");
 
-    // Dragging a bar has to move the log: that is what the reader actually uses it for.
+    // Dragging a bar has to move the log: that is what the reader actually uses it for. Clearing the
+    // log throws the selection away, so it is made again — that is what keeps the line on screen here,
+    // the pointer being wherever the machine's mouse happens to be.
     ClearLog();
     for (int line = 0; line < 40; ++line) AppendLog(wide + L" " + std::to_wstring(line));
     SendMessageW(logEdit, EM_LINESCROLL, 0, -100000);
+    SendMessageW(logEdit, EM_SETSEL, 0, (LPARAM)-1);
+    RefreshLogBars();
     Pump();
     int lineBefore = (int)SendMessageW(logEdit, EM_GETFIRSTVISIBLELINE, 0, 0);
     LPARAM bottomOfBar = MAKELPARAM(2, height - 2);
@@ -474,6 +494,39 @@ static void RunScreenChecks() {
     PositionLogBars();
     Settle(250);
 
+    // The bars belong to the reader's attention: with the pointer away from the box and nothing
+    // selected they must not be on screen at all. The cursor is parked out of the way first so this is
+    // not a question of where the machine's mouse happens to be.
+    POINT savedCursor{};
+    GetCursorPos(&savedCursor);
+    SetCursorPos(work.left + 4, work.top + 4);
+    SendMessageW(logEdit, EM_SETSEL, 0, 0);
+    RefreshLogBars();
+    Settle(200);
+    Seen idle = LookAtScreen(logVerticalBar);
+    ReportScreen("idle (pointer away, no selection)", logVerticalBar);
+    Check(!logHovered && !logSelected && idle.ourLine == 0 && idle.systemTrack == 0,
+        "on screen: nothing is drawn while the reader is not working with the log");
+
+    // Selecting the log is enough on its own.
+    SendMessageW(logEdit, EM_SETSEL, 0, (LPARAM)-1);
+    RefreshLogBars();
+    Settle(200);
+    Seen selected = LookAtScreen(logVerticalBar);
+    ReportScreen("with a selection", logVerticalBar);
+    Check(selected.ourLine > 0, "on screen: a selection brings the line out");
+
+    // So is the pointer over the box.
+    SendMessageW(logEdit, EM_SETSEL, 0, 0);
+    RECT boxScreen{};
+    GetWindowRect(logEdit, &boxScreen);
+    SetCursorPos((boxScreen.left + boxScreen.right) / 2, (boxScreen.top + boxScreen.bottom) / 2);
+    mouse_event(MOUSEEVENTF_MOVE, 1, 0, 0, 0);
+    Settle(250);
+    Seen hovering = LookAtScreen(logVerticalBar);
+    ReportScreen("pointer over the log box", logVerticalBar);
+    Check(hovering.ourLine > 0, "on screen: hovering the log box brings the line out");
+
     Seen rest = LookAtScreen(logVerticalBar);
     // Real hit testing, on the real screen: a click on the bar has to reach the bar, not the text.
     RECT barScreen{};
@@ -485,17 +538,29 @@ static void RunScreenChecks() {
     Check(rest.systemTrack == 0 && rest.systemThumb == 0 && rest.ourLine > 0,
         "on screen: the system bar is hidden and only our line shows");
 
-    RECT strip{};
-    GetWindowRect(logVerticalBar, &strip);
-    LPARAM over = MAKELPARAM((strip.left + strip.right) / 2, (strip.top + strip.bottom) / 2);
-    SendMessageW(logEdit, WM_NCMOUSEMOVE, 0, over);
-    SendMessageW(logEdit, WM_NCMOUSELEAVE, 0, 0);
-    SendMessageW(logEdit, WM_NCMOUSEMOVE, 0, over);
+    // Keep a selection for the remaining states, so the line stays out whatever the pointer does.
+    SendMessageW(logEdit, EM_SETSEL, 0, (LPARAM)-1);
+    RefreshLogBars();
+    Settle(150);
+
+    // The pointer leaving takes the line away again, once the selection is gone as well.
+    SendMessageW(logEdit, EM_SETSEL, 0, 0);
+    RefreshLogBars();
+    Settle(200);
+    Seen stillOverBox = LookAtScreen(logVerticalBar);
+    ReportScreen("selection cleared, pointer still over the box", logVerticalBar);
+    Check(stillOverBox.ourLine > 0, "on screen: the pointer alone keeps the line out");
+    SetCursorPos(work.left + 4, work.top + 4);
+    mouse_event(MOUSEEVENTF_MOVE, 1, 0, 0, 0);
     Settle(250);
-    Seen hovered = LookAtScreen(logVerticalBar);
-    ReportScreen("after hover messages", logVerticalBar);
-    Check(hovered.systemTrack == 0 && hovered.systemThumb == 0 && hovered.ourLine > 0,
-        "on screen: hovering does not bring the system bar back");
+    Seen pointerAway = LookAtScreen(logVerticalBar);
+    ReportScreen("pointer away again", logVerticalBar);
+    Check(pointerAway.ourLine == 0, "on screen: the line goes away when the pointer leaves");
+
+    // Keep a selection for the remaining states, so they do not depend on where the pointer is.
+    SendMessageW(logEdit, EM_SETSEL, 0, (LPARAM)-1);
+    RefreshLogBars();
+    Settle(150);
 
     SendMessageW(logEdit, EM_LINESCROLL, 0, 7);
     InvalidateLogBars();
@@ -548,6 +613,7 @@ static void RunScreenChecks() {
     Check(horizontal.systemTrack == 0 && horizontal.systemThumb == 0 && horizontal.ourLine > 0,
         "on screen: the horizontal bar shows its own line and no system chrome");
 
+    SetCursorPos(savedCursor.x, savedCursor.y);
     DestroyWindow(logEdit);
     logEdit = nullptr;
     logVerticalBar = logHorizontalBar = nullptr;
@@ -799,31 +865,31 @@ static int RunChecks(int argc, wchar_t** argv) {
         "the painted log border encloses the text box");
     Check(W - 2 * logSide > 0, "the log text box keeps a positive width");
 
-    // Right-click menu geometry. Measured from the reported screenshot: a 96x55 client area, two
-    // 25px bands, which the shell placed at 4px and 29px from the top, leaving the selection box
-    // 6px from the left edge and 5px from the right, 4px above the first item and 1px below the
-    // last. The box is now laid out from the client area, so the margins come out equal.
-    Check(CentredBandTop(55, 25, 2, 29) == 27, "the shell's top-heavy band padding is shifted down");
-    Check(CentredBandTop(55, 25, 2, 4) == 2, "the first band moves with it, keeping the two 25px bands adjacent");
-    Check(CentredBandTop(55, 25, 2, 2) == 2, "an already centred layout is left alone");
-    Check(CentredBandTop(40, 25, 2, 0) == 0 && CentredBandTop(55, 0, 2, 0) == 0 && CentredBandTop(55, 25, 0, 0) == 0,
-        "impossible layouts fall back to the band the shell supplied");
-
-    RECT client{0, 0, 96, 55};
-    int band = 25, inset = 3, pad = 2;
-    int firstTop = 2, secondTop = CentredBandTop(55, band, 2, 29);
-    RECT firstBand{client.left, firstTop, client.right, firstTop + band};
-    RECT secondBand{client.left, secondTop, client.right, secondTop + band};
-    RECT first = HighlightRect(firstBand, inset, pad);
-    RECT second = HighlightRect(secondBand, inset, pad);
-    Check(first.left - client.left == client.right - first.right &&
-        second.left - client.left == client.right - second.right,
-        "both selection boxes keep equal left and right margins");
-    Check(first.left - client.left == inset && first.top - firstBand.top == pad,
-        "the box is inset by the configured amount, not by a pen width");
-    Check((first.top - client.top) - (client.bottom - second.bottom) <= 1,
-        "the first and last box margins differ by at most the leftover pixel");
-    Check(second.top >= first.bottom, "the two boxes do not overlap");
+    // Right-click menu geometry. The shell's own item bands are not laid out squarely inside the popup
+    // (measured: 6px from the left edge but 5px from the right, 4px above the first item and 1px below
+    // the last), and the selection box used to inset 3px sideways but only 2px vertically on top of
+    // that. The items tile the client now and the box takes the same margin on every side, which is
+    // what the reader asked for: the gap above the first item matches the gap to its left.
+    RECT menuClient{0, 0, 96, 57};
+    int menuCount = 2, menuMargin = Scaled(menuItemInset);
+    RECT firstBand = MenuItemBand(menuClient, menuCount, 0);
+    RECT secondBand = MenuItemBand(menuClient, menuCount, 1);
+    Check(firstBand.top == menuClient.top && secondBand.bottom == menuClient.bottom &&
+          firstBand.bottom == secondBand.top,
+        "the two menu items tile the popup, leaving no leftover padding on any side");
+    Check(firstBand.right == menuClient.right && firstBand.left == menuClient.left,
+        "each item spans the popup's width, so both boxes are the same width");
+    RECT first = HighlightRect(firstBand, menuMargin);
+    RECT second = HighlightRect(secondBand, menuMargin);
+    Check(first.left - menuClient.left == first.top - menuClient.top &&
+          first.left - menuClient.left == menuClient.right - first.right,
+        "the first selection box keeps the same margin on the top, left and right");
+    Check(second.left - menuClient.left == menuClient.bottom - second.bottom,
+        "the last selection box keeps the same margin at the bottom as at its left");
+    Check(second.top > first.bottom, "the two boxes stay apart, with a gap between them");
+    std::printf("      menu box margins: top %d, left %d, right %d, bottom %d (item %dx%d)\n",
+        first.top - menuClient.top, first.left - menuClient.left, menuClient.right - first.right,
+        menuClient.bottom - second.bottom, firstBand.right - firstBand.left, firstBand.bottom - firstBand.top);
 
     CheckLogBars();
 

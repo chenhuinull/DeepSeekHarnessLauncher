@@ -119,6 +119,8 @@ static State status = State::Missing;
 static Button hoverButton = Button::None;
 static std::wstring statusTip = L"未安装固件", updateLabel = L"更新", rollbackVersion;
 static int logLineCount = 0;
+static bool logHovered = false;         // the pointer is over the log box (or a bar is being dragged)
+static bool logSelected = false;        // the log has a selection to look at
 static int logMaxLineWidth = 0;         // widest line in the retained log, in pixels
 static int logMaxLineIndex = -1;        // which line that was, so a trim knows when to rescan
 static int logHorizontalOffset = 0;     // pixels the text is scrolled sideways
@@ -1466,6 +1468,8 @@ static void PaintLogBarLine(HDC dc, HWND cover, int bar) {
     RECT client{};
     GetClientRect(cover, &client);
     FillRect(dc, &client, LogBackgroundBrush());
+    // Nothing but the box colour until the reader is working with the log.
+    if (!logHovered && !logSelected) return;
     bool vertical = bar == SB_VERT;
     LogBarMetrics metrics;
     if (!LogBarMetricsFor(bar, vertical ? client.bottom : client.right, metrics)) return;
@@ -1495,6 +1499,36 @@ static void PaintLogBarLine(HDC dc, HWND cover, int bar) {
 static void InvalidateLogBars() {
     if (logVerticalBar) InvalidateRect(logVerticalBar, nullptr, FALSE);
     if (logHorizontalBar) InvalidateRect(logHorizontalBar, nullptr, FALSE);
+}
+
+// The bars belong to the reader's attention, not to the panel's looks: the line is painted only while
+// the pointer is over the log box, or while something is selected to look at. Nothing has to be polled
+// for that — the box and the two bars are separate windows, so each of them reports the pointer
+// arriving and leaving, which a system scroll bar inside the control's non-client area could not.
+static bool LogBoxContainsCursor() {
+    if (!logEdit) return false;
+    RECT box{};
+    if (!GetWindowRect(logEdit, &box)) return false;
+    for (HWND bar : {logVerticalBar, logHorizontalBar}) {
+        RECT barRect{};
+        if (bar && GetWindowRect(bar, &barRect)) UnionRect(&box, &box, &barRect);
+    }
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return false;
+    return PtInRect(&box, cursor) != 0;
+}
+
+static void RefreshLogBars() {
+    if (!logEdit) return;
+    LONG start = 0, end = 0;
+    bool selected = LogSelectionRange(start, end);
+    bool dragging = (logVerticalBar && GetCapture() == logVerticalBar) ||
+                    (logHorizontalBar && GetCapture() == logHorizontalBar);
+    bool hovered = dragging || LogBoxContainsCursor();
+    if (hovered == logHovered && selected == logSelected) return;
+    logHovered = hovered;
+    logSelected = selected;
+    InvalidateLogBars();
 }
 
 // Put the line where the pointer asks for, in the launcher's own units: lines for the vertical bar,
@@ -1561,12 +1595,22 @@ static LRESULT CALLBACK LogBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if (logEdit) SetFocus(logEdit);
         SetCapture(hwnd);
         DragLogBarTo(hwnd, bar, bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp));
+        RefreshLogBars();
         return 0;
     case WM_MOUSEMOVE:
         if (GetCapture() == hwnd) DragLogBarTo(hwnd, bar, bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp));
+        else {
+            TRACKMOUSEEVENT leaving{sizeof(leaving), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&leaving);
+            RefreshLogBars();
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        RefreshLogBars();
         return 0;
     case WM_LBUTTONUP:
         if (GetCapture() == hwnd) ReleaseCapture();
+        RefreshLogBars();
         return 0;
     case WM_MOUSEWHEEL:
         // The wheel over a bar is still meant for the log.
@@ -1719,12 +1763,13 @@ static void OpenBrowserIfNoPage() {
 
 // The log box offers only what makes sense for a read-only log: copy the selection
 // and clear the box. The stock edit menu (cut/paste/undo/select all) is suppressed.
-// The items are owner drawn so the hover/selection background is exactly the same width
-// for both of them, inset the same amount from the popup's left and right edges, instead
-// of whatever the shell theme decides to paint.
+// The items are owner drawn so the hover/selection background is exactly the same width for both of
+// them, with the same margin from the popup's frame on every side.
 static constexpr int menuItemWidth = 78, menuItemHeight = 26, menuItemInset = 3;
-static const std::wstring menuCopyLabel = L"复制";
-static const std::wstring menuClearLabel = L"清除";
+// An owner drawn item gets its label and its position through itemData, so the layout does not have to
+// guess which item it is looking at from the band the shell handed over.
+struct LogMenuItemLabel { const wchar_t* label; int index; };
+static const LogMenuItemLabel menuCopyItem{L"复制", 0}, menuClearItem{L"清除", 1};
 static constexpr UINT_PTR menuCopyCommand = 1, menuClearCommand = 2;
 
 // Popup menus are a "#32768" window owned by whichever process shows them. Rounding its
@@ -1756,8 +1801,8 @@ static void RoundOwnedMenuFrameSoon() {
 static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    AppendMenuW(menu, MF_OWNERDRAW, menuCopyCommand, (LPCWSTR)&menuCopyLabel);
-    AppendMenuW(menu, MF_OWNERDRAW, menuClearCommand, (LPCWSTR)&menuClearLabel);
+    AppendMenuW(menu, MF_OWNERDRAW, menuCopyCommand, (LPCWSTR)&menuCopyItem);
+    AppendMenuW(menu, MF_OWNERDRAW, menuClearCommand, (LPCWSTR)&menuClearItem);
     if (logBackground) {
         MENUINFO info{};
         info.cbSize = sizeof(info);
@@ -1785,54 +1830,50 @@ static void MeasureLogMenuItem(MEASUREITEMSTRUCT* measure) {
     measure->itemHeight = Scaled(menuItemHeight);
 }
 
-// The shell hands over an item band that is not laid out squarely inside the popup: measured on the
-// reported menu the selection box ended up 6px from the left edge but 5px from the right, with 4px
-// above the first item and 1px below the last. Both margins are therefore derived from the popup's
-// client area instead of from wherever the shell decided to put the band.
-//
-// Pure geometry, so the equal-margin rule is checkable without a live popup. The bands are evenly
-// spaced, so the first band's offset is what remains after taking whole bands out of this one.
-static int CentredBandTop(int clientHeight, int band, int count, int bandTop) {
-    if (band <= 0 || count <= 0 || count * band > clientHeight) return bandTop;
-    return bandTop + (clientHeight - count * band) / 2 - bandTop % band;
+// The filled box, inset the same amount from every side of the item it sits in — one number for both
+// axes, so the gap above the first item matches the gap to its left.
+static RECT HighlightRect(const RECT& box, int inset) {
+    return RECT{box.left + inset, box.top + inset, box.right - inset, box.bottom - inset};
 }
 
-// The filled box, inset the same amount from every side of the band it sits in.
-static RECT HighlightRect(const RECT& box, int inset, int pad) {
-    RECT highlight{box.left + inset, box.top + pad, box.right - inset, box.bottom - pad};
-    return highlight;
+// The item's own band, in the popup's client area. The shell's bands are not laid out squarely inside
+// the popup (measured on the reported menu: 6px from the left edge but 5px from the right, 4px above
+// the first item and 1px below the last), so the items tile the client from its top edge instead. The
+// only margin left then is the one the highlight applies, and it is the same on all four sides.
+// One item's band in the popup's client area: the items tile the client from its top edge, and the
+// last one takes whatever is left. Pure geometry, so the equal-margin rule can be checked without a
+// live popup.
+static RECT MenuItemBand(const RECT& client, int count, int index) {
+    int height = client.bottom - client.top;
+    if (count <= 0 || index < 0 || index >= count || height <= 0) return client;
+    int band = height / count;
+    if (band <= 0) return client;
+    RECT box{client.left, client.top + index * band, client.right, client.top + (index + 1) * band};
+    if (index + 1 == count) box.bottom = client.bottom;
+    return box;
 }
 
-static RECT LogMenuBox(const DRAWITEMSTRUCT* draw) {
+static RECT LogMenuItemBox(const DRAWITEMSTRUCT* draw, int index) {
     RECT box = draw->rcItem;
     HWND popup = WindowFromDC(draw->hDC);
     RECT client{};
     if (!popup || !GetClientRect(popup, &client)) return box;
-    int width = client.right - client.left, height = client.bottom - client.top;
-    if (width <= 0) return box;
-    box.left = client.left;
-    box.right = client.right;
-    int band = box.bottom - box.top;
     HMENU menu = (HMENU)SendMessageW(popup, MN_GETHMENU, 0, 0);
     int count = menu ? GetMenuItemCount(menu) : 0;
-    if (band > 0 && count > 0) {
-        int top = client.top + CentredBandTop(height, band, count, box.top - client.top);
-        box.top = top;
-        box.bottom = top + band;
-    }
-    return box;
+    if (client.right <= client.left || count <= 0 || index < 0 || index >= count) return box;
+    return MenuItemBand(client, count, index);
 }
 
 static void DrawLogMenuItem(const DRAWITEMSTRUCT* draw) {
-    const std::wstring* label = (const std::wstring*)draw->itemData;
-    if (!label) return;
+    const LogMenuItemLabel* item = (const LogMenuItemLabel*)draw->itemData;
+    if (!item || !item->label) return;
     bool selected = (draw->itemState & ODS_SELECTED) != 0;
     bool disabled = (draw->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
-    RECT box = LogMenuBox(draw);
+    RECT box = LogMenuItemBox(draw, item->index);
     HBRUSH background = logBackground ? logBackground : (HBRUSH)GetStockObject(WHITE_BRUSH);
     FillRect(draw->hDC, &box, background);
 
-    RECT highlight = HighlightRect(box, Scaled(menuItemInset), Scaled(2));
+    RECT highlight = HighlightRect(box, Scaled(menuItemInset));
     Graphics g(draw->hDC);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     GraphicsPath path;
@@ -1849,7 +1890,7 @@ static void DrawLogMenuItem(const DRAWITEMSTRUCT* draw) {
     SetBkMode(draw->hDC, TRANSPARENT);
     SetTextColor(draw->hDC, disabled ? RGB(160,170,185) : selected ? RGB(30,64,175) : RGB(35,50,76));
     RECT text = box; text.top += Scaled(1); text.bottom += Scaled(1);
-    DrawTextW(draw->hDC, label->c_str(), -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(draw->hDC, item->label, -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(draw->hDC, previous);
     DeleteObject(font);
 }
@@ -1883,14 +1924,26 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
         // state covers key messages that were posted rather than generated by real input.
         if (wp == 'A' && ((GetKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000))) {
             SendMessageW(hwnd, EM_SETSEL, 0, (LPARAM)-1);
+            RefreshLogBars();
             return 0;
         }
         break;
+    case WM_MOUSEMOVE: {
+        // The pointer arrives: this is one of the two things that bring the bars out.
+        TRACKMOUSEEVENT leaving{sizeof(leaving), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&leaving);
+        RefreshLogBars();
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        RefreshLogBars();
+        return 0;
     case WM_KEYUP:
     case WM_LBUTTONUP:
     case WM_LBUTTONDBLCLK:
         // The caret moving can scroll the view sideways without the launcher asking, so the tracked
-        // offset is refreshed from the control itself.
+        // offset is refreshed from the control itself. A click or a key can also change the selection,
+        // which is the other thing that brings the bars out.
         break;
     }
     LRESULT result = DefSubclassProc(hwnd, message, wp, lp);
@@ -1899,7 +1952,7 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
     case WM_LBUTTONUP:
     case WM_LBUTTONDBLCLK:
         SyncLogHorizontalOffset();
-        InvalidateLogBars();
+        RefreshLogBars();
         break;
     }
     return result;
@@ -2361,10 +2414,14 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             Button previous=hoverButton; hoverButton=hit;
             InvalidateButton(previous); InvalidateButton(hoverButton);
         }
+        // The pointer may be leaving the log box for the window's own area; the bars follow that too.
+        RefreshLogBars();
         TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE,hwnd,0}; TrackMouseEvent(&tme); return 0;
     }
     case WM_MOUSELEAVE: {
-        Button previous=hoverButton; hoverButton=Button::None; InvalidateButton(previous); return 0;
+        Button previous=hoverButton; hoverButton=Button::None; InvalidateButton(previous);
+        RefreshLogBars();
+        return 0;
     }
     case WM_LBUTTONDOWN: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
