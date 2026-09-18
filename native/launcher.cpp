@@ -1283,6 +1283,32 @@ static const std::wstring menuCopyLabel = L"复制";
 static const std::wstring menuClearLabel = L"清除";
 static constexpr UINT_PTR menuCopyCommand = 1, menuClearCommand = 2;
 
+// Popup menus are a "#32768" window owned by whichever process shows them. Rounding its
+// frame and giving it the launcher's border colour makes the menus match the window.
+static void RoundMenuFrame(HWND popup) {
+    DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
+    DwmSetWindowAttribute(popup, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    COLORREF border = RGB(169, 184, 204);
+    DwmSetWindowAttribute(popup, DWMWA_BORDER_COLOR, &border, sizeof(border));
+    SetWindowPos(popup, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+// That window does not exist yet while WM_INITMENUPOPUP runs — it is created just before
+// the menu is shown — so a short-lived helper waits for it instead. It gives up after a
+// few seconds and never blocks the UI thread, which is inside TrackPopupMenu by then.
+static void RoundOwnedMenuFrameSoon() {
+    std::thread([] {
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            HWND popup = FindWindowW(L"#32768", nullptr);
+            DWORD pid = 0;
+            if (popup) GetWindowThreadProcessId(popup, &pid);
+            if (popup && pid == GetCurrentProcessId()) { RoundMenuFrame(popup); return; }
+            Sleep(15);
+        }
+    }).detach();
+}
+
 static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -1301,6 +1327,7 @@ static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
     if (screenPosition == (LPARAM)-1) GetCursorPos(&point);
     else { point.x = GET_X_LPARAM(screenPosition); point.y = GET_Y_LPARAM(screenPosition); }
     SetForegroundWindow(windowHandle);
+    RoundOwnedMenuFrameSoon();
     int command = (int)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
         point.x, point.y, 0, windowHandle, nullptr);
     DestroyMenu(menu);
@@ -1462,6 +1489,7 @@ static void ShowTrayMenu() {
     POINT cursor{};
     GetCursorPos(&cursor);
     if (IsWindowVisible(windowHandle)) SetForegroundWindow(windowHandle);
+    RoundOwnedMenuFrameSoon();
     int command = (int)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
         cursor.x, cursor.y, 0, windowHandle, nullptr);
     DestroyMenu(menu);
@@ -1878,6 +1906,18 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             AppendLog(L"上次可用版本是 "+rollbackVersion+L"，“更新”按钮已变为橙色，点击即可回退。");
         if(failed) ExpandLog(true);
         stopping=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
+    }
+    case WM_INITMENUPOPUP: {
+        // Popup menus are a "#32768" window owned by the shell, so their frame is square by
+        // default. Round it and give it the launcher's border colour so both menus match the
+        // window they belong to. Harmless where DWM corner support is missing.
+        if (HWND popup = FindWindowW(L"#32768", nullptr)) {
+            DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
+            DwmSetWindowAttribute(popup, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+            COLORREF border = RGB(169, 184, 204);
+            DwmSetWindowAttribute(popup, DWMWA_BORDER_COLOR, &border, sizeof(border));
+        }
+        return 0;
     }
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT* measure = (MEASUREITEMSTRUCT*)lp;
