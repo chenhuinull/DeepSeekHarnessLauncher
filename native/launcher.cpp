@@ -108,6 +108,9 @@ static const UiRect closeRect{titleClusterX + titleButtonWidth, buttonTop, title
 // The whale icon doubles as the fold/unfold handle, so it is excluded from dragging.
 static const UiRect iconRect{10, 8, 26, 32};
 
+static int Scaled(int n);   // defined with the layout code further down
+static void Rounded(GraphicsPath& p, float x, float y, float w, float h, float radius);
+
 static std::wstring Utf8(const std::string& s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(), nullptr, 0);
@@ -1272,13 +1275,28 @@ static void OpenBrowserIfNoPage() {
 
 // The log box offers only what makes sense for a read-only log: copy the selection
 // and clear the box. The stock edit menu (cut/paste/undo/select all) is suppressed.
+// The items are owner drawn so the hover/selection background is exactly the same width
+// for both of them, inset the same amount from the popup's left and right edges, instead
+// of whatever the shell theme decides to paint.
+static constexpr int menuItemWidth = 78, menuItemHeight = 26, menuItemInset = 3;
+static const std::wstring menuCopyLabel = L"复制";
+static const std::wstring menuClearLabel = L"清除";
+static constexpr UINT_PTR menuCopyCommand = 1, menuClearCommand = 2;
+
 static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
-    AppendMenuW(menu, MF_STRING, 1, L"复制");
-    AppendMenuW(menu, MF_STRING, 2, L"清除");
+    AppendMenuW(menu, MF_OWNERDRAW, menuCopyCommand, (LPCWSTR)&menuCopyLabel);
+    AppendMenuW(menu, MF_OWNERDRAW, menuClearCommand, (LPCWSTR)&menuClearLabel);
+    if (logBackground) {
+        MENUINFO info{};
+        info.cbSize = sizeof(info);
+        info.fMask = MIM_BACKGROUND;
+        info.hbrBack = logBackground;
+        SetMenuInfo(menu, &info);
+    }
     LONG from = 0, to = 0;
-    if (!LogSelectionRange(from, to)) EnableMenuItem(menu, 1, MF_BYCOMMAND | MF_GRAYED);
+    if (!LogSelectionRange(from, to)) EnableMenuItem(menu, menuCopyCommand, MF_BYCOMMAND | MF_GRAYED);
     POINT point{};
     if (screenPosition == (LPARAM)-1) GetCursorPos(&point);
     else { point.x = GET_X_LPARAM(screenPosition); point.y = GET_Y_LPARAM(screenPosition); }
@@ -1287,8 +1305,45 @@ static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
         point.x, point.y, 0, windowHandle, nullptr);
     DestroyMenu(menu);
     PostMessageW(windowHandle, WM_NULL, 0, 0);
-    if (command == 1) SendMessageW(logEdit, WM_COPY, 0, 0);
-    else if (command == 2) ClearLog();
+    if (command == (int)menuCopyCommand) SendMessageW(logEdit, WM_COPY, 0, 0);
+    else if (command == (int)menuClearCommand) ClearLog();
+}
+
+static void MeasureLogMenuItem(MEASUREITEMSTRUCT* measure) {
+    measure->itemWidth = Scaled(menuItemWidth);
+    measure->itemHeight = Scaled(menuItemHeight);
+}
+
+static void DrawLogMenuItem(const DRAWITEMSTRUCT* draw) {
+    const std::wstring* label = (const std::wstring*)draw->itemData;
+    if (!label) return;
+    bool selected = (draw->itemState & ODS_SELECTED) != 0;
+    bool disabled = (draw->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
+    RECT box = draw->rcItem;
+    HBRUSH background = logBackground ? logBackground : (HBRUSH)GetStockObject(WHITE_BRUSH);
+    FillRect(draw->hDC, &box, background);
+
+    int inset = Scaled(menuItemInset);
+    int pad = Scaled(2);
+    Graphics g(draw->hDC);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    GraphicsPath path;
+    // Filled, not stroked, so the box is not shrunk by a pen width: both insets stay equal.
+    Rounded(path, (float)(box.left + inset), (float)(box.top + pad),
+        (float)(box.right - box.left - 2 * inset), (float)(box.bottom - box.top - 2 * pad),
+        controlCornerRadius);
+    SolidBrush fill(selected ? Color(219,234,254) : Color(255,255,255));
+    if (selected) g.FillPath(&fill, &path);
+
+    HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
+    HGDIOBJ previous = SelectObject(draw->hDC, font);
+    SetBkMode(draw->hDC, TRANSPARENT);
+    SetTextColor(draw->hDC, disabled ? RGB(160,170,185) : selected ? RGB(30,64,175) : RGB(35,50,76));
+    RECT text = box; text.top += Scaled(1); text.bottom += Scaled(1);
+    DrawTextW(draw->hDC, label->c_str(), -1, &text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(draw->hDC, previous);
+    DeleteObject(font);
 }
 
 static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
@@ -1318,7 +1373,6 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
 // Single place that defines the log control, so the behaviour under test is the same
 // one the window creates.
 static int Scaled(int n);
-
 static void CreateLogEdit(HWND parent) {
     logEdit = CreateWindowExW(0,L"EDIT",L"",
         WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|ES_AUTOHSCROLL|ES_NOHIDESEL,
@@ -1335,6 +1389,8 @@ static void CreateLogEdit(HWND parent) {
 }
 
 // ---------------------------------------------------------------- tray icon
+
+static int Scaled(int n);   // defined with the layout code below
 
 static constexpr UINT WM_TRAYICON = WM_APP + 20;
 static constexpr UINT trayIconId = 1;
@@ -1822,6 +1878,16 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             AppendLog(L"上次可用版本是 "+rollbackVersion+L"，“更新”按钮已变为橙色，点击即可回退。");
         if(failed) ExpandLog(true);
         stopping=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
+    }
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* measure = (MEASUREITEMSTRUCT*)lp;
+        if (measure && measure->CtlType == ODT_MENU) { MeasureLogMenuItem(measure); return TRUE; }
+        break;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* draw = (DRAWITEMSTRUCT*)lp;
+        if (draw && draw->CtlType == ODT_MENU) { DrawLogMenuItem(draw); return TRUE; }
+        break;
     }
     case WM_TRAYICON:
         switch (LOWORD(lp)) {
