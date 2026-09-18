@@ -53,7 +53,7 @@ static constexpr int trimChunk = 500;
 static constexpr UINT_PTR logHoverTimer = 1;
 static constexpr UINT logHoverIntervalMs = 120;
 static constexpr DWORD readyProbeIntervalMs = 1'000;
-static constexpr float buttonCornerRadius = 4.5f;
+static constexpr float controlCornerRadius = 4.0f;   // buttons and the log box share this
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
 // Versions this build is known to work with. Downloads stay reproducible and a
 // newer dsh is only installed when the user asks for it.
@@ -1259,7 +1259,7 @@ static void DrawButton(Graphics& g, const UiRect& r, const std::wstring& label, 
     Color fg = primary ? Color(255,255,255) : Color(35,50,76);
     if (disabled) { bg = Color(248,250,252); fg = Color(160,170,185); border = Color(221,228,238); }
     else if (hoverButton == button) { bg = primary ? Color(29,78,216) : Color(239,246,255); }
-    GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, buttonCornerRadius);
+    GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, controlCornerRadius);
     SolidBrush fill(bg); Pen edge(border, 1); g.FillPath(&fill, &path); g.DrawPath(&edge, &path);
 }
 
@@ -1289,7 +1289,7 @@ static void Paint() {
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning);
     DrawButton(g,topRect,topmost ? L"关闭置顶" : L"开启置顶",Button::Topmost);
-    GraphicsPath titlePath; Rounded(titlePath,titleClusterX + .5f,10.5f,49,27,buttonCornerRadius); SolidBrush pale(Color(248,250,252));
+    GraphicsPath titlePath; Rounded(titlePath,titleClusterX + .5f,10.5f,49,27,controlCornerRadius); SolidBrush pale(Color(248,250,252));
     Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
         GraphicsState saved = g.Save(); g.SetClip(&titlePath);
@@ -1304,7 +1304,7 @@ static void Paint() {
     g.DrawLine(&cross,closeRect.x + 8,19,closeRect.x + 16,29);
     g.DrawLine(&cross,closeRect.x + 16,19,closeRect.x + 8,29);
     if (expanded) {
-        GraphicsPath logBox; Rounded(logBox,14.5f,48.5f,(float)(W - 29),165,7); Pen logBorder(Color(221,228,238),1);
+        GraphicsPath logBox; Rounded(logBox,14.5f,48.5f,(float)(W - 29),165,controlCornerRadius); Pen logBorder(Color(221,228,238),1);
         g.DrawPath(&logBorder,&logBox);
     }
     g.Flush();
