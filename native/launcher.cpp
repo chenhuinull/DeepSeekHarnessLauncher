@@ -50,6 +50,8 @@ static constexpr int W = titleClusterX + 2 * titleButtonWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
 static constexpr int maxLogLines = 50'000;
 static constexpr int trimChunk = 500;
+static constexpr UINT_PTR logHoverTimer = 1;
+static constexpr UINT logHoverIntervalMs = 120;
 static constexpr DWORD readyProbeIntervalMs = 1'000;
 static constexpr float buttonCornerRadius = 4.5f;
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
@@ -81,7 +83,7 @@ static State status = State::Missing;
 static Button hoverButton = Button::None;
 static std::wstring statusTip = L"未安装固件", updateLabel = L"检查更新", rollbackVersion;
 static int logLineCount = 0;
-static bool logHovered = false;
+static bool logHovered = false, logScrollBarShown = false;
 static HWND tooltip;
 static TOOLINFOW tipInfo{};
 static float scaleFactor = 1.0f;
@@ -1068,13 +1070,31 @@ static void UpdateLogScrollBar() {
     if (!logEdit) return;
     LONG start = 0, end = 0;
     bool selected = LogSelectionRange(start, end);
-    ShowScrollBar(logEdit, SB_VERT, (logHovered || selected) && LogOverflows());
+    bool want = (logHovered || selected) && LogOverflows();
+    if (want == logScrollBarShown) return;   // ShowScrollBar repaints, so only on change
+    logScrollBarShown = want;
+    ShowScrollBar(logEdit, SB_VERT, want);
+}
+
+// Polled instead of tracked through WM_MOUSELEAVE: the scrollbar belongs to the edit, so
+// once it appears the pointer sits on it, the control reports that the mouse left its
+// client area and the bar would hide again — over and over, which is the flicker.
+static void UpdateLogHover() {
+    if (!logEdit) return;
+    POINT cursor{};
+    RECT box{};
+    if (!GetCursorPos(&cursor) || !GetWindowRect(logEdit, &box)) return;
+    bool over = PtInRect(&box, cursor) != 0;
+    if (over == logHovered) return;
+    logHovered = over;
+    UpdateLogScrollBar();
 }
 
 static void ClearLog() {
     if (!logEdit) return;
     logLineCount = 0;
     SetWindowTextW(logEdit, L"");
+    logScrollBarShown = false;
     ShowScrollBar(logEdit, SB_VERT, FALSE);
 }
 
@@ -1145,16 +1165,8 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
         }
         break;
     case WM_MOUSEMOVE:
-        if (!logHovered) {
-            logHovered = true;
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
-            TrackMouseEvent(&track);
-            UpdateLogScrollBar();
-        }
-        break;
+        break;   // hover is polled by the timer, which also covers the scrollbar
     case WM_MOUSELEAVE:
-        logHovered = false;
-        UpdateLogScrollBar();
         return 0;
     case WM_LBUTTONUP:
     case WM_KEYUP:
@@ -1202,6 +1214,11 @@ static void Layout() {
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(20), Scaled(53), Scaled(W - 40), Scaled(157), SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(logEdit, expanded ? SW_SHOW : SW_HIDE);
+        if (expanded) SetTimer(windowHandle, logHoverTimer, logHoverIntervalMs, nullptr);
+        else {
+            KillTimer(windowHandle, logHoverTimer);
+            logHovered = false;
+        }
         UpdateLogScrollBar();
     }
     InvalidateRect(windowHandle, nullptr, TRUE);
@@ -1414,6 +1431,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         else OnClick(hit);
         return 0;
     }
+    case WM_TIMER:
+        if (wp == logHoverTimer) { UpdateLogHover(); return 0; }
+        break;
     case WM_LOG: {
         std::unique_ptr<std::wstring> line((std::wstring*)lp);
         if(!closing) AppendLog(*line); return 0;
