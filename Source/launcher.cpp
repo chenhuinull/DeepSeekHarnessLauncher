@@ -34,7 +34,26 @@ static constexpr UINT WM_SERVER_ADOPTED = WM_APP + 6;
 static constexpr UINT WM_DOWNLOAD = WM_APP + 7;
 static constexpr UINT WM_SERVER_UNHEALTHY = WM_APP + 8;
 static constexpr UINT WM_SERVER_HEALTHY = WM_APP + 9;
-static constexpr int H_COLLAPSED = 48, H_EXPANDED = 228;
+static constexpr int H_COLLAPSED = 48;
+// The log panel: the text box and the border painted around it. The panel used to be
+// 157px tall and is shown 30% shorter (157 × 0.7 = 110), so H_EXPANDED follows from the
+// panel instead of being a separate number that could drift out of step with it.
+static constexpr int logTop = 53, logSide = 20, logHeight = 110, logBottom = 18;
+static constexpr int H_EXPANDED = logTop + logHeight + logBottom;
+// The painted border sits at logBoxTop/logBoxSide; inside it the text box takes everything except a
+// narrow zone next to the border, and that zone is where the two scroll bars live. No system scroll
+// bar is involved, so nothing is reserved for a non-client strip and the text gets the space.
+static constexpr float logBoxTop = 48.5f, logBoxSide = 14.5f;
+static constexpr float logBoxHeight = logHeight + 8;
+static constexpr int logBarZone = 7;
+// The log font. The log is mostly Chinese, and Consolas has no Chinese glyphs at all: they were font
+// linked from another family and squeezed into a Latin cell, which read as squashed. NSimSun draws
+// both scripts itself. 13px and not 12: at 12 its glyphs fill the cell exactly (ink 12 rows in a 12px
+// line), so the lines touch; at 13 there are 12 rows of ink in a 13px line, which leaves a hairline
+// between them and still fits eight whole lines in the panel. Consolas stays as the fallback.
+static constexpr int logFontHeight = 13;
+static const wchar_t* const logFontFace = L"NSimSun";
+static const wchar_t* const logFontFallback = L"Consolas";
 // The whole button row is derived from these numbers, so the window width follows the
 // button width instead of being a separate constant.
 static constexpr int buttonWidth = 46, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
@@ -50,13 +69,20 @@ static constexpr int lastButtonRight = topmostX + buttonWidth;
 static constexpr int titleClusterGap = 8, titleButtonWidth = 25, rightMargin = 14;
 static constexpr int titleClusterX = lastButtonRight + titleClusterGap;
 static constexpr int W = titleClusterX + 2 * titleButtonWidth + rightMargin;
+// Inside the painted border the text box takes everything except the bar zone, so the text gets the
+// space a system scroll bar strip would have taken.
+static constexpr int logBoxRightPx = W - 17, logBoxBottomPx = 48 + logHeight + 8;
+static constexpr int logEditWidth = logBoxRightPx - logBarZone - logSide;
+static constexpr int logEditHeight = logBoxBottomPx - logBarZone - logTop;
+// The launcher's own window style. WS_CLIPCHILDREN is what a window that owns controls should carry:
+// without it the window's painting is not clipped away from the log box and its bars, and any erase
+// path that is not BeginPaint (which clips by itself) can touch them.
+static constexpr DWORD mainWindowStyle = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
 // Folded down to the whale icon and the status lamp; the rest of the chip drags.
 static constexpr int W_MINI = statusX + indicatorWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
 static constexpr int maxLogLines = 50'000;
 static constexpr int trimChunk = 500;
-static constexpr UINT_PTR logHoverTimer = 1;
-static constexpr UINT logHoverIntervalMs = 120;
 static constexpr DWORD readyProbeIntervalMs = 1'000;
 // After the service is up, keep asking the port whether it still answers: a process can
 // stay alive while the web server inside it is gone.
@@ -93,7 +119,10 @@ static State status = State::Missing;
 static Button hoverButton = Button::None;
 static std::wstring statusTip = L"未安装固件", updateLabel = L"更新", rollbackVersion;
 static int logLineCount = 0;
-static bool logHovered = false, logScrollBarShown = false;
+static int logMaxLineWidth = 0;         // widest line in the retained log, in pixels
+static int logMaxLineIndex = -1;        // which line that was, so a trim knows when to rescan
+static int logHorizontalOffset = 0;     // pixels the text is scrolled sideways
+static int logTextOriginX = INT_MIN;    // x of character 0 while the view is not scrolled
 static HWND tooltip;
 static TOOLINFOW tipInfo{};
 static float scaleFactor = 1.0f;
@@ -219,8 +248,9 @@ static fs::path ServerLogFile() { return runtimeDir.parent_path() / L"server.log
 static fs::path LocalNodeRoot() { return runtimeDir.parent_path() / L"tools" / L"node"; }
 static bool Installed() { return fs::exists(EntryPoint()); }
 
-static std::wstring Version() {
-    std::ifstream file(PackageJson(), std::ios::binary);
+// The `version` field of a package.json, read without executing anything.
+static std::wstring JsonVersion(const fs::path& packageJson) {
+    std::ifstream file(packageJson, std::ios::binary);
     if (!file) return {};
     std::string json((std::istreambuf_iterator<char>(file)), {});
     size_t key = json.find("\"version\"");
@@ -229,6 +259,37 @@ static std::wstring Version() {
     if (colon == std::string::npos || first == std::string::npos) return {};
     size_t last = json.find('"', first + 1);
     return last == std::string::npos ? L"" : Utf8(json.substr(first + 1, last - first - 1));
+}
+
+static std::wstring Version() { return JsonVersion(PackageJson()); }
+
+// npm writes diagnostics to the same pipe as its answer, and an unknown key in the
+// user's .npmrc is quoted verbatim, e.g.
+//   npm warn Unknown user config "allow-scripts". This will stop working ...
+// Taking the first quoted token would read that config key as a release: the check
+// would then report an update on every run, and the button would stay violet forever.
+// Only a token shaped like a version may be trusted, so a warning is skipped instead.
+static bool LooksLikeVersion(const std::wstring& text) {
+    if (text.empty() || text.size() > 64) return false;
+    bool digit = false, dot = false;
+    for (wchar_t c : text) {
+        if (c >= L'0' && c <= L'9') { digit = true; continue; }
+        if (c == L'.') { dot = true; continue; }
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'-' || c == L'+') continue;
+        return false;
+    }
+    return digit && dot;
+}
+
+static std::wstring QuotedVersion(const std::wstring& output) {
+    for (size_t open = output.find(L'"'); open != std::wstring::npos; ) {
+        size_t close = output.find(L'"', open + 1);
+        if (close == std::wstring::npos) break;
+        std::wstring candidate = output.substr(open + 1, close - open - 1);
+        if (LooksLikeVersion(candidate)) return candidate;
+        open = output.find(L'"', close + 1);
+    }
+    return {};
 }
 
 static std::wstring FindOnPath(const wchar_t* name) {
@@ -241,19 +302,24 @@ static std::wstring FindOnPath(const wchar_t* name) {
     return path;
 }
 
-struct NodeTools { std::wstring node, npm; };
+struct NodeTools { std::wstring node, npm, npmVersion; };
 static std::optional<NodeTools> CompleteNode(const fs::path& root) {
     fs::path node = root / L"node.exe";
     fs::path npm = root / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
-    if (fs::is_regular_file(node) && fs::is_regular_file(npm)) return NodeTools{node.wstring(), npm.wstring()};
+    if (fs::is_regular_file(node) && fs::is_regular_file(npm)) return NodeTools{node.wstring(), npm.wstring(), {}};
     return std::nullopt;
+}
+
+static std::wstring PathVariable() {
+    DWORD length = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+    std::wstring path(length ? length : 1, L'\0');
+    if (length) { DWORD used = GetEnvironmentVariableW(L"PATH", path.data(), length); path.resize(used); }
+    return path;
 }
 
 static void PrependLocalNodeToPath() {
     std::wstring root = LocalNodeRoot().wstring();
-    DWORD length = GetEnvironmentVariableW(L"PATH", nullptr, 0);
-    std::wstring path(length ? length : 1, L'\0');
-    if (length) { DWORD used = GetEnvironmentVariableW(L"PATH", path.data(), length); path.resize(used); }
+    std::wstring path = PathVariable();
     if (path.rfind(root + L";", 0) != 0) SetEnvironmentVariableW(L"PATH", (root + L";" + path).c_str());
 }
 
@@ -274,6 +340,103 @@ static void PostLog(const std::wstring& line) {
     if (closing) return;
     auto* copy = new std::wstring(line);
     if (!PostMessageW(windowHandle, WM_LOG, 0, (LPARAM)copy)) delete copy;
+}
+
+// npm ships as plain JavaScript, so its version is readable from the package next to
+// npm-cli.js without running it. Which npm runs matters: 11.13 rejects `allow-scripts`
+// as an unknown .npmrc key while 11.17 accepts it, and the older copy's warning then
+// polluted the update check. The launcher therefore prefers the newest npm the chosen
+// Node.js can be expected to run, and logs which one it picked.
+static std::wstring NpmCliVersion(const std::wstring& cli) {
+    return JsonVersion(fs::path(cli).parent_path().parent_path() / L"package.json");
+}
+
+static std::wstring NpmPackageRoot(const std::wstring& cli) {
+    return fs::path(cli).parent_path().parent_path().wstring();
+}
+
+static std::wstring NpmLabel(const NodeTools& tools) {
+    return tools.npmVersion.empty() ? L"npm（版本未知）" : L"npm v" + tools.npmVersion;
+}
+
+static bool SamePath(const std::wstring& a, const std::wstring& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        wchar_t x = a[i], y = b[i];
+        if (x >= L'A' && x <= L'Z') x += 32;
+        if (y >= L'A' && y <= L'Z') y += 32;
+        if (x != y) return false;
+    }
+    return true;
+}
+
+static long MajorOf(const std::wstring& version) {
+    long major = 0;
+    for (wchar_t c : version) {
+        if (c < L'0' || c > L'9') break;
+        major = major * 10 + (c - L'0');
+    }
+    return major;
+}
+
+static int CompareVersions(const std::wstring& a, const std::wstring& b) {
+    size_t i = 0, j = 0;
+    for (int component = 0; component < 3; ++component) {
+        long left = 0, right = 0;
+        while (i < a.size() && a[i] >= L'0' && a[i] <= L'9') left = left * 10 + (a[i++] - L'0');
+        while (j < b.size() && b[j] >= L'0' && b[j] <= L'9') right = right * 10 + (b[j++] - L'0');
+        if (left != right) return left < right ? -1 : 1;
+        if (i < a.size() && a[i] == L'.') ++i;
+        if (j < b.size() && b[j] == L'.') ++j;
+    }
+    return 0;
+}
+
+// Every npm this machine offers: the one paired with the chosen Node.js, the launcher's
+// private runtime, the installation holding node.exe, and any directory on PATH.
+static std::vector<std::wstring> NpmCandidates(const std::wstring& paired) {
+    std::vector<std::wstring> found;
+    auto add = [&](const std::wstring& cli) {
+        if (cli.empty() || !fs::is_regular_file(cli)) return;
+        for (const auto& seen : found) if (SamePath(seen, cli)) return;
+        found.push_back(cli);
+    };
+    add(paired);
+    if (auto local = CompleteNode(LocalNodeRoot())) add(local->npm);
+    std::wstring node = FindOnPath(L"node.exe");
+    if (!node.empty()) { if (auto system = CompleteNode(fs::path(node).parent_path())) add(system->npm); }
+    std::wstring path = PathVariable();
+    for (size_t start = 0; start < path.size(); ) {
+        size_t end = path.find(L';', start);
+        std::wstring dir = path.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        while (!dir.empty() && (dir.back() == L' ' || dir.back() == L'"')) dir.pop_back();
+        if (!dir.empty() && dir.front() == L'"') dir.erase(0, 1);
+        if (!dir.empty()) add((fs::path(dir) / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js").wstring());
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return found;
+}
+
+// Keep the npm paired with the chosen Node.js unless another copy is newer. The upgrade
+// stays inside one major version: a cross-major jump may require a Node.js newer than
+// the one that would run it. The decision is logged, so the log always names the npm
+// that actually ran.
+static void PreferNewestNpm(NodeTools& tools) {
+    tools.npmVersion = NpmCliVersion(tools.npm);
+    if (tools.npmVersion.empty()) return;
+    std::wstring best = tools.npm, bestVersion = tools.npmVersion;
+    for (const auto& cli : NpmCandidates(tools.npm)) {
+        std::wstring version = NpmCliVersion(cli);
+        if (version.empty() || MajorOf(version) != MajorOf(tools.npmVersion)) continue;
+        if (CompareVersions(version, bestVersion) > 0) { best = cli; bestVersion = version; }
+    }
+    if (!SamePath(best, tools.npm)) {
+        PostLog(L"发现更新的 npm v" + bestVersion + L"（" + NpmPackageRoot(best) + L"），未使用 v" +
+            tools.npmVersion + L"。");
+        tools.npm = best;
+        tools.npmVersion = bestVersion;
+    }
 }
 
 static void SetJob(HANDLE& slot, HANDLE job) { std::lock_guard lock(processMutex); slot = job; }
@@ -614,6 +777,16 @@ static std::wstring FileVersionString(const fs::path& file) {
     return text;
 }
 
+// Adopt the launcher's private runtime: put it first on PATH for child processes, take a
+// newer npm if the machine has one, and report the Node.js/npm pair that will run.
+static NodeTools AdoptLocalNode(NodeTools local) {
+    PrependLocalNodeToPath();
+    PreferNewestNpm(local);
+    std::wstring version = FileVersionString(LocalNodeRoot() / L"node.exe");
+    PostLog(L"使用本地 Node.js " + (version.empty() ? L"" : L"v" + version + L" ") + L"和 " + NpmLabel(local) + L"。");
+    return local;
+}
+
 static void InstallLocalNode() {
     std::wstring version = pinnedNodeVersion;
     std::wstring folder = L"node-v" + version + L"-win-x64";
@@ -672,39 +845,33 @@ static std::wstring ExceptionMessage(const std::exception& e);
 static std::optional<NodeTools> SystemNode() {
     std::wstring systemNode = FindOnPath(L"node.exe");
     if (systemNode.empty()) return std::nullopt;
-    fs::path root = fs::path(systemNode).parent_path();
-    if (auto system = CompleteNode(root)) {
-        PostLog(L"使用系统 Node.js 和 npm。");
-        return system;
-    }
-    std::wstring npmCmd = FindOnPath(L"npm.cmd");
-    if (!npmCmd.empty()) {
-        fs::path npm = fs::path(npmCmd).parent_path() / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
-        if (fs::is_regular_file(npm)) {
-            PostLog(L"使用系统 Node.js 和 npm。");
-            return NodeTools{systemNode, npm.wstring()};
+    std::optional<NodeTools> system;
+    if (auto bundled = CompleteNode(fs::path(systemNode).parent_path())) {
+        system = bundled;
+    } else {
+        // Node.js installed without its bundled npm: borrow the npm found on PATH.
+        std::wstring npmCmd = FindOnPath(L"npm.cmd");
+        if (!npmCmd.empty()) {
+            fs::path npm = fs::path(npmCmd).parent_path() / L"node_modules" / L"npm" / L"bin" / L"npm-cli.js";
+            if (fs::is_regular_file(npm)) system = NodeTools{systemNode, npm.wstring(), {}};
         }
     }
-    return std::nullopt;
+    if (!system) return std::nullopt;
+    PreferNewestNpm(*system);
+    std::wstring version = FileVersionString(systemNode);
+    PostLog(L"使用系统 Node.js " + (version.empty() ? L"" : L"v" + version + L" ") + L"和 " + NpmLabel(*system) + L"。");
+    return system;
 }
 
 static std::optional<NodeTools> FindNodeWithoutDownload() {
-    if (auto local = CompleteNode(LocalNodeRoot())) {
-        PrependLocalNodeToPath();
-        PostLog(L"使用本地 Node.js 和 npm。");
-        return local;
-    }
+    if (auto local = CompleteNode(LocalNodeRoot())) return AdoptLocalNode(*local);
     return SystemNode();
 }
 
 static NodeTools FindNode() {
     if (auto local = CompleteNode(LocalNodeRoot())) {
         std::wstring version = FileVersionString(LocalNodeRoot() / L"node.exe");
-        if (version.empty() || version == pinnedNodeVersion) {
-            PrependLocalNodeToPath();
-            PostLog(version.empty() ? L"使用本地 Node.js 和 npm。" : L"使用本地 Node.js v" + version + L" 和 npm。");
-            return *local;
-        }
+        if (version.empty() || version == pinnedNodeVersion) return AdoptLocalNode(*local);
         // The launcher ships a pinned runtime. Refreshing the private copy keeps the pin
         // meaningful after an upgrade, but a network failure must not break a working copy.
         PostLog(L"本地 Node.js v" + version + L" 与启动器内置的 v" + pinnedNodeVersion + L" 不一致，正在更新运行时…");
@@ -713,10 +880,7 @@ static NodeTools FindNode() {
         } catch (const std::exception& e) {
             PostLog(L"更新 Node.js 失败：" + ExceptionMessage(e) + L"；继续使用本地 v" + version + L"。");
         }
-        if (auto refreshed = CompleteNode(LocalNodeRoot())) {
-            PrependLocalNodeToPath();
-            return *refreshed;
-        }
+        if (auto refreshed = CompleteNode(LocalNodeRoot())) return AdoptLocalNode(*refreshed);
         if (auto system = SystemNode()) return *system;
         throw std::runtime_error("node download failed");
     }
@@ -1044,6 +1208,8 @@ static std::wstring ExceptionMessage(const std::exception& e) {
     if (what == "pipe") return L"无法建立子进程输出管道。";
     if (what == "rollback missing") return L"没有可回退的版本记录。";
     if (what == "update timeout") return L"检查更新超过 " + std::to_wstring(updateCheckTimeoutMs / 1000) + L" 秒，已停止检查。";
+    if (what == "check failed") return L"查询 npm 上的最新版本失败；请检查网络或代理后重试。";
+    if (what == "version missing") return L"npm 返回的最新版本号无法识别，请稍后重试。";
     if (what.rfind("extract failed: ", 0) == 0) return L"解压 Node.js 压缩包失败（退出码 " + Utf8(what.substr(16)) + L"）。";
     if (what.rfind("install failed:", 0) == 0) return L"安装失败（退出码 " + Utf8(what.substr(16)) + L"）。请查看运行日志。";
     if (what.rfind("port busy: ", 0) == 0) return L"本地端口 " + std::to_wstring((int)serverPort) +
@@ -1075,12 +1241,13 @@ static void Worker(Work work) {
             }
             PostLog(L"正在检查 npm 上的最新版本…");
             std::wstring output;
-            DWORD code = RunNode(existing->node, {existing->npm, L"view", L"@deepseek-ai/dsh", L"version", L"--json"},
+            // Keep warnings off the stream as well, so the log stays readable.
+            DWORD code = RunNode(existing->node,
+                {existing->npm, L"view", L"@deepseek-ai/dsh", L"version", L"--json", L"--loglevel=error"},
                 &output, updateCheckTimeoutMs);
             if (code != 0) throw std::runtime_error("check failed");
-            size_t first = output.find(L'\"'), last = output.find(L'\"', first + 1);
-            if (first == std::wstring::npos || last == std::wstring::npos) throw std::runtime_error("version missing");
-            result->version = output.substr(first + 1, last - first - 1);
+            result->version = QuotedVersion(output);
+            if (result->version.empty()) throw std::runtime_error("version missing");
             result->installed = Installed();
             result->update = result->installed && Version() != result->version;
             result->ok = true;
@@ -1123,27 +1290,6 @@ static void Worker(Work work) {
     finish();
 }
 
-static int LogLineHeight() {
-    HDC dc = GetDC(logEdit);
-    if (!dc) return 0;
-    HFONT font = (HFONT)SendMessageW(logEdit, WM_GETFONT, 0, 0);
-    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
-    TEXTMETRICW metrics{};
-    bool ok = GetTextMetricsW(dc, &metrics);
-    if (previous) SelectObject(dc, previous);
-    ReleaseDC(logEdit, dc);
-    return ok ? metrics.tmHeight + metrics.tmExternalLeading : 0;
-}
-
-static bool LogOverflows() {
-    if (!logEdit) return false;
-    RECT client{}; GetClientRect(logEdit, &client);
-    int lineHeight = LogLineHeight();
-    if (client.bottom <= 0 || lineHeight <= 0) return false;
-    int visible = client.bottom / lineHeight;
-    return (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) > visible + 1;
-}
-
 // EM_GETSEL's return value packs both positions into 16 bits, which is wrong once the
 // log passes 64k characters; the pointer form reports the real 32-bit range.
 static bool LogSelectionRange(LONG& start, LONG& end) {
@@ -1153,51 +1299,343 @@ static bool LogSelectionRange(LONG& start, LONG& end) {
     return end > start;
 }
 
-// The bar stays out of the way until it is useful: content that overflows and either
-// the pointer is over the box or something is selected.
-static void UpdateLogScrollBar() {
-    if (!logEdit) return;
-    LONG start = 0, end = 0;
-    bool selected = LogSelectionRange(start, end);
-    bool want = (logHovered || selected) && LogOverflows();
-    if (want == logScrollBarShown) return;   // ShowScrollBar repaints, so only on change
-    logScrollBarShown = want;
-    ShowScrollBar(logEdit, SB_VERT, want);
-}
-
-// Polled instead of tracked through WM_MOUSELEAVE: the scrollbar belongs to the edit, so
-// once it appears the pointer sits on it, the control reports that the mouse left its
-// client area and the bar would hide again — over and over, which is the flicker.
-static void UpdateLogHover() {
-    if (!logEdit) return;
-    POINT cursor{};
-    RECT box{};
-    if (!GetCursorPos(&cursor) || !GetWindowRect(logEdit, &box)) return;
-    bool over = PtInRect(&box, cursor) != 0;
-    if (over == logHovered) return;
-    logHovered = over;
-    UpdateLogScrollBar();
-}
+// Both scroll bars are ordinary always-present edit bars, one per direction; only their painting is
+// replaced below. Keeping them out of the way until they were needed was tried and cannot work: the
+// edit only maintains a bar's range while that bar is shown, so a hidden bar reports a frozen range
+// and the box can no longer tell whether new content overflows.
+static void InvalidateLogBars();
 
 static void ClearLog() {
     if (!logEdit) return;
     logLineCount = 0;
+    logMaxLineWidth = 0;
+    logMaxLineIndex = -1;
+    logHorizontalOffset = 0;
     SetWindowTextW(logEdit, L"");
-    logScrollBarShown = false;
-    ShowScrollBar(logEdit, SB_VERT, FALSE);
+    InvalidateLogBars();
+}
+
+// ---------------------------------------------------------------- log scroll bars
+//
+// The log box shows a bare line where a scroll bar would be: no track, no arrow buttons, no system
+// chrome at all. The control carries no scroll bar styles, so there is no non-client strip to hide
+// and the text takes the whole panel except a narrow zone next to the painted border. What the bars
+// need is measured here rather than read from the control's scroll bars:
+//
+//   * vertical: line count, line height and the first visible line, all exact;
+//   * horizontal: the longest line, tracked as lines arrive, and the pixel offset, read back
+//     through the position of character 0 whenever it is representable.
+//
+// The two bars are small windows of our own placed in that zone. They paint the line and turn
+// dragging and the wheel into scrolling.
+
+static constexpr int logBarThickness = 4;         // the width of the line
+static constexpr int logBarEdgeGap = 1;           // the line sits this close to the box border
+static constexpr int logBarShortestThumb = 24;    // so a huge log still leaves something to grab
+static HWND logVerticalBar = nullptr, logHorizontalBar = nullptr;
+
+// A bar's numbers in the units the launcher uses: lines for the vertical bar, pixels for the
+// horizontal one. Painting and dragging both work from this.
+struct LogBarMetrics {
+    int range = 0, page = 0, position = 0;   // content size, visible size, current offset
+    int track = 0, thumb = 0, offset = 0;    // and the same three mapped onto the bar
+    int scrollable = 0;
+};
+
+static int LogCharWidth();
+
+static int LogLineHeight() {
+    static int height = 0;
+    if (height > 0 || !logEdit) return height > 0 ? height : 12;
+    HDC dc = GetDC(logEdit);
+    if (!dc) return 12;
+    HFONT font = (HFONT)SendMessageW(logEdit, WM_GETFONT, 0, 0);
+    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
+    TEXTMETRICW metrics{};
+    // tmHeight alone: this is the spacing the edit packs its lines with. Adding tmExternalLeading
+    // looks more correct but is not what the control does — measured with NSimSun it fits eight
+    // 12px lines into the 106px box, while tmHeight + leading predicted only seven.
+    if (GetTextMetricsW(dc, &metrics)) height = metrics.tmHeight;
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(logEdit, dc);
+    if (height <= 0) height = 12;
+    return height;
+}
+
+static int LogContentWidth() { return logMaxLineWidth; }
+
+// Width of a line of log text in pixels, using the control's own font. Character counts are not
+// enough here: a Chinese glyph is twice as wide as a Latin one.
+static int LogLineWidth(const std::wstring& text) {
+    if (!logEdit || text.empty()) return 0;
+    HDC dc = GetDC(logEdit);
+    if (!dc) return 0;
+    HFONT font = (HFONT)SendMessageW(logEdit, WM_GETFONT, 0, 0);
+    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
+    SIZE size{};
+    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &size);
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(logEdit, dc);
+    return size.cx;
+}
+
+// Walking every line only happens when the widest one was among those just dropped, so an ordinary
+// append costs nothing.
+static void RescanLogLineWidths() {
+    if (!logEdit) return;
+    int lines = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
+    logMaxLineWidth = 0;
+    logMaxLineIndex = lines > 0 ? 0 : -1;
+    std::wstring buffer;
+    for (int line = 0; line < lines; ++line) {
+        int start = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)line, 0);
+        if (start < 0) continue;
+        int length = (int)SendMessageW(logEdit, EM_LINELENGTH, (WPARAM)start, 0);
+        if (length <= 0) continue;
+        buffer.assign((size_t)length + 1, L'\0');
+        *reinterpret_cast<WORD*>(buffer.data()) = (WORD)length;   // EM_GETLINE wants the size up front
+        int copied = (int)SendMessageW(logEdit, EM_GETLINE, (WPARAM)line, (LPARAM)buffer.data());
+        if (copied <= 0) continue;
+        buffer.resize((size_t)copied);
+        int width = LogLineWidth(buffer);
+        if (width > logMaxLineWidth) { logMaxLineWidth = width; logMaxLineIndex = line; }
+    }
+}
+
+// Character 0 sits at the text's own left inset when nothing is scrolled and moves left by exactly
+// the offset. The value comes back as a short, so a very large offset is not representable and the
+// tracked one is kept instead.
+static void SyncLogHorizontalOffset() {
+    if (!logEdit) return;
+    int x = (int)(short)LOWORD(SendMessageW(logEdit, EM_POSFROMCHAR, 0, 0));
+    if (logTextOriginX == INT_MIN) { logTextOriginX = x; return; }
+    if (x <= logTextOriginX && x > -32000) logHorizontalOffset = logTextOriginX - x;
+}
+
+static bool LogBarMetricsFor(int bar, int track, LogBarMetrics& metrics) {
+    if (!logEdit || track <= 0) return false;
+    RECT client{};
+    if (!GetClientRect(logEdit, &client)) return false;
+    if (bar == SB_VERT) {
+        int lines = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
+        int lineHeight = LogLineHeight();
+        if (lines <= 0 || lineHeight <= 0) return false;
+        metrics.range = lines;
+        metrics.page = client.bottom / lineHeight;
+        if (metrics.page < 1) metrics.page = 1;
+        metrics.position = (int)SendMessageW(logEdit, EM_GETFIRSTVISIBLELINE, 0, 0);
+    } else {
+        metrics.range = LogContentWidth();
+        metrics.page = client.right;
+        metrics.position = logHorizontalOffset;
+    }
+    if (metrics.range <= metrics.page) return false;   // everything fits: no line at all
+    metrics.scrollable = metrics.range - metrics.page;
+    if (metrics.position > metrics.scrollable) metrics.position = metrics.scrollable;
+    if (metrics.position < 0) metrics.position = 0;
+    metrics.track = track;
+    metrics.thumb = (int)((long long)track * metrics.page / metrics.range);
+    int shortest = Scaled(logBarShortestThumb);
+    if (metrics.thumb < shortest) metrics.thumb = shortest;
+    if (metrics.thumb > track) metrics.thumb = track;
+    metrics.offset = (int)((long long)(track - metrics.thumb) * metrics.position / metrics.scrollable);
+    return true;
+}
+
+static HBRUSH LogBackgroundBrush() {
+    return logBackground ? logBackground : (HBRUSH)GetStockObject(WHITE_BRUSH);
+}
+
+// The log font is fixed pitch, so pixels and characters convert through one number.
+static int LogCharWidth() {
+    static int width = 0;
+    if (width > 0 || !logEdit) return width > 0 ? width : 8;
+    HDC dc = GetDC(logEdit);
+    if (!dc) return 8;
+    HFONT font = (HFONT)SendMessageW(logEdit, WM_GETFONT, 0, 0);
+    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
+    SIZE size{};
+    if (GetTextExtentPoint32W(dc, L"0123456789", 10, &size) && size.cx > 0) width = (size.cx + 5) / 10;
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(logEdit, dc);
+    if (width <= 0) width = 8;
+    return width;
+}
+
+static void PaintLogBarLine(HDC dc, HWND cover, int bar) {
+    RECT client{};
+    GetClientRect(cover, &client);
+    FillRect(dc, &client, LogBackgroundBrush());
+    bool vertical = bar == SB_VERT;
+    LogBarMetrics metrics;
+    if (!LogBarMetricsFor(bar, vertical ? client.bottom : client.right, metrics)) return;
+    int thickness = Scaled(logBarThickness);
+    int span = vertical ? client.right : client.bottom;
+    if (thickness > span) thickness = span;
+    // The line hugs the outside of the strip, next to the box border, instead of floating in the
+    // middle of it: what is left over then reads as the box's inner margin rather than as blank
+    // space on both sides of the bar.
+    int edge = span - thickness - Scaled(logBarEdgeGap);
+    if (edge < 0) edge = 0;
+    RECT line{};
+    if (vertical) {
+        line = {edge, metrics.offset, edge + thickness, metrics.offset + metrics.thumb};
+    } else {
+        line = {metrics.offset, edge, metrics.offset + metrics.thumb, edge + thickness};
+    }
+    Graphics graphics(dc);
+    graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+    GraphicsPath path;
+    Rounded(path, (float)line.left, (float)line.top, (float)(line.right - line.left),
+        (float)(line.bottom - line.top), thickness / 2.0f);
+    SolidBrush brush(Color(203, 213, 225));
+    graphics.FillPath(&brush, &path);
+}
+
+static void InvalidateLogBars() {
+    if (logVerticalBar) InvalidateRect(logVerticalBar, nullptr, FALSE);
+    if (logHorizontalBar) InvalidateRect(logHorizontalBar, nullptr, FALSE);
+}
+
+// Put the line where the pointer asks for, in the launcher's own units: lines for the vertical bar,
+// pixels (through the fixed pitch width) for the horizontal one.
+static void DragLogBarTo(HWND cover, int bar, int position) {
+    RECT client{};
+    GetClientRect(cover, &client);
+    bool vertical = bar == SB_VERT;
+    LogBarMetrics metrics;
+    if (!LogBarMetricsFor(bar, vertical ? client.bottom : client.right, metrics)) return;
+    int travel = metrics.track - metrics.thumb;
+    if (travel <= 0) return;
+    int along = position - metrics.thumb / 2;
+    if (along < 0) along = 0;
+    if (along > travel) along = travel;
+    int target = (int)((long long)metrics.scrollable * along / travel);
+    if (vertical) {
+        int delta = target - metrics.position;
+        if (delta) SendMessageW(logEdit, EM_LINESCROLL, 0, delta);
+    } else {
+        // EM_LINESCROLL counts characters, and a Chinese glyph is two cells wide, so a single step
+        // can land short of the pixel target: ask again until the offset is close enough.
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            int step = (target - logHorizontalOffset) / LogCharWidth();
+            if (!step) break;
+            SendMessageW(logEdit, EM_LINESCROLL, step, 0);
+            SyncLogHorizontalOffset();
+        }
+    }
+    InvalidateLogBars();
+}
+
+static LRESULT CALLBACK LogBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+    int bar = hwnd == logVerticalBar ? SB_VERT : SB_HORZ;
+    switch (message) {
+    // No WM_ERASEBKGND shortcut here: claiming the background is already erased while the window
+    // has no background brush of its own leaves newly exposed areas uninitialised, and whatever is
+    // underneath — the system scroll bar — shows through them.
+    case WM_PRINTCLIENT: {
+        PaintLogBarLine((HDC)wp, hwnd, bar);
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        // Through a memory bitmap: filling the strip and then drawing the line straight onto the
+        // window is two separate steps, and during a drag that reads as a white blink at every step.
+        HDC buffer = CreateCompatibleDC(dc);
+        HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
+        HGDIOBJ previous = SelectObject(buffer, bitmap);
+        PaintLogBarLine(buffer, hwnd, bar);
+        BitBlt(dc, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
+        SelectObject(buffer, previous);
+        DeleteObject(bitmap);
+        DeleteDC(buffer);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    // Clicking a bar must not take the caret away from the log, or the keyboard stops scrolling it.
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_LBUTTONDOWN:
+        if (logEdit) SetFocus(logEdit);
+        SetCapture(hwnd);
+        DragLogBarTo(hwnd, bar, bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp));
+        return 0;
+    case WM_MOUSEMOVE:
+        if (GetCapture() == hwnd) DragLogBarTo(hwnd, bar, bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp));
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) ReleaseCapture();
+        return 0;
+    case WM_MOUSEWHEEL:
+        // The wheel over a bar is still meant for the log.
+        if (logEdit) { SendMessageW(logEdit, WM_MOUSEWHEEL, wp, lp); InvalidateLogBars(); }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+
+// The two bars fill the zone next to the painted border: a vertical one beside the text, a
+// horizontal one under it. Both are siblings of the control raised above it.
+static void PositionLogBars() {
+    if (!logEdit || !logVerticalBar || !logHorizontalBar) return;
+    int right = Scaled(logSide + logEditWidth);
+    int bottom = Scaled(logTop + logEditHeight);
+    int zone = Scaled(logBarZone);
+    // HWND_TOP and not SWP_NOZORDER: a newly created child is not guaranteed to sit above its
+    // siblings, and a bar that ends up below the control would be invisible.
+    SetWindowPos(logVerticalBar, HWND_TOP, right, Scaled(logTop), zone, Scaled(logEditHeight), SWP_NOACTIVATE);
+    SetWindowPos(logHorizontalBar, HWND_TOP, Scaled(logSide), bottom, Scaled(logEditWidth), zone, SWP_NOACTIVATE);
+    // Resizing and raising happen outside WM_PAINT, so paint both covers right away rather than
+    // leaving the new area to be filled whenever Windows gets round to it.
+    for (HWND cover : {logVerticalBar, logHorizontalBar}) {
+        InvalidateRect(cover, nullptr, TRUE);
+        UpdateWindow(cover);
+    }
+}
+
+static void CreateLogBars(HWND parent) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW info{sizeof(info)};
+        info.lpfnWndProc = LogBarProc;
+        info.hInstance = GetModuleHandleW(nullptr);
+        info.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        info.lpszClassName = L"DeepSeekHarnessLogBar";
+        // A background brush is what makes the window opaque: exposed parts are erased to it before
+        // WM_PAINT runs, so nothing from underneath can ever show through.
+        info.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+        RegisterClassExW(&info);
+        registered = true;
+    }
+    logVerticalBar = CreateWindowExW(0, L"DeepSeekHarnessLogBar", L"", WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    logHorizontalBar = CreateWindowExW(0, L"DeepSeekHarnessLogBar", L"", WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
 }
 
 static void AppendLog(const std::wstring& line) {
     if (!logEdit) return;
     SYSTEMTIME now; GetLocalTime(&now);
     wchar_t stamp[32]; wsprintfW(stamp, L"[%02d:%02d:%02d] ", now.wHour, now.wMinute, now.wSecond);
-    std::wstring entry = stamp; entry += line; entry += L"\r\n";
+    std::wstring entry = stamp; entry += line;
+    // The separator goes in front of the entry, never after it. Ending the text with a newline leaves
+    // an empty line at the bottom that the view is pinned to, so the last line of the panel shows
+    // nothing but white — the space the reader sees going to waste. This way the newest line is the
+    // last line of the text and sits at the bottom of the box.
+    bool first = GetWindowTextLengthW(logEdit) == 0;
+    std::wstring appended = first ? entry : (L"\r\n" + entry);
     // Append instead of rebuilding the whole box: with a 50k line cap a full
     // SetWindowText per line would be quadratic.
     int length = GetWindowTextLengthW(logEdit);
     SendMessageW(logEdit, EM_SETSEL, length, length);
-    SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)entry.c_str());
-    for (wchar_t c : entry) if (c == L'\n') ++logLineCount;
+    SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)appended.c_str());
+    ++logLineCount;
+    // The horizontal bar needs the widest line, in pixels: a Chinese glyph is two cells wide, so a
+    // character count would not describe the line's width.
+    int width = LogLineWidth(entry);
+    if (width > logMaxLineWidth) { logMaxLineWidth = width; logMaxLineIndex = logLineCount - 1; }
     if (logLineCount > maxLogLines) {
         // Drop a whole chunk rather than one line: deleting from the front of an edit
         // control moves the remaining text, so doing it per line is needlessly costly.
@@ -1209,6 +1647,11 @@ static void AppendLog(const std::wstring& line) {
             SendMessageW(logEdit, EM_SETSEL, 0, cut);
             SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
             logLineCount -= excess;
+            // Only a trim that drops the longest line costs a rescan of what is left.
+            if (logMaxLineIndex >= 0) {
+                if (logMaxLineIndex < excess) RescanLogLineWidths();
+                else logMaxLineIndex -= excess;
+            }
         }
     }
     // Park the caret at the start of the last line: it keeps the view pinned to the
@@ -1217,7 +1660,8 @@ static void AppendLog(const std::wstring& line) {
     int lastStart = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)lastLine, 0);
     if (lastStart >= 0) SendMessageW(logEdit, EM_SETSEL, lastStart, lastStart);
     SendMessageW(logEdit, EM_SCROLLCARET, 0, 0);
-    UpdateLogScrollBar();
+    SyncLogHorizontalOffset();
+    InvalidateLogBars();
 }
 
 // dsh is started with --no-open, so the launcher decides: it reads the URL dsh printed
@@ -1341,23 +1785,60 @@ static void MeasureLogMenuItem(MEASUREITEMSTRUCT* measure) {
     measure->itemHeight = Scaled(menuItemHeight);
 }
 
+// The shell hands over an item band that is not laid out squarely inside the popup: measured on the
+// reported menu the selection box ended up 6px from the left edge but 5px from the right, with 4px
+// above the first item and 1px below the last. Both margins are therefore derived from the popup's
+// client area instead of from wherever the shell decided to put the band.
+//
+// Pure geometry, so the equal-margin rule is checkable without a live popup. The bands are evenly
+// spaced, so the first band's offset is what remains after taking whole bands out of this one.
+static int CentredBandTop(int clientHeight, int band, int count, int bandTop) {
+    if (band <= 0 || count <= 0 || count * band > clientHeight) return bandTop;
+    return bandTop + (clientHeight - count * band) / 2 - bandTop % band;
+}
+
+// The filled box, inset the same amount from every side of the band it sits in.
+static RECT HighlightRect(const RECT& box, int inset, int pad) {
+    RECT highlight{box.left + inset, box.top + pad, box.right - inset, box.bottom - pad};
+    return highlight;
+}
+
+static RECT LogMenuBox(const DRAWITEMSTRUCT* draw) {
+    RECT box = draw->rcItem;
+    HWND popup = WindowFromDC(draw->hDC);
+    RECT client{};
+    if (!popup || !GetClientRect(popup, &client)) return box;
+    int width = client.right - client.left, height = client.bottom - client.top;
+    if (width <= 0) return box;
+    box.left = client.left;
+    box.right = client.right;
+    int band = box.bottom - box.top;
+    HMENU menu = (HMENU)SendMessageW(popup, MN_GETHMENU, 0, 0);
+    int count = menu ? GetMenuItemCount(menu) : 0;
+    if (band > 0 && count > 0) {
+        int top = client.top + CentredBandTop(height, band, count, box.top - client.top);
+        box.top = top;
+        box.bottom = top + band;
+    }
+    return box;
+}
+
 static void DrawLogMenuItem(const DRAWITEMSTRUCT* draw) {
     const std::wstring* label = (const std::wstring*)draw->itemData;
     if (!label) return;
     bool selected = (draw->itemState & ODS_SELECTED) != 0;
     bool disabled = (draw->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
-    RECT box = draw->rcItem;
+    RECT box = LogMenuBox(draw);
     HBRUSH background = logBackground ? logBackground : (HBRUSH)GetStockObject(WHITE_BRUSH);
     FillRect(draw->hDC, &box, background);
 
-    int inset = Scaled(menuItemInset);
-    int pad = Scaled(2);
+    RECT highlight = HighlightRect(box, Scaled(menuItemInset), Scaled(2));
     Graphics g(draw->hDC);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     GraphicsPath path;
     // Filled, not stroked, so the box is not shrunk by a pen width: both insets stay equal.
-    Rounded(path, (float)(box.left + inset), (float)(box.top + pad),
-        (float)(box.right - box.left - 2 * inset), (float)(box.bottom - box.top - 2 * pad),
+    Rounded(path, (float)highlight.left, (float)highlight.top,
+        (float)(highlight.right - highlight.left), (float)(highlight.bottom - highlight.top),
         controlCornerRadius);
     SolidBrush fill(selected ? Color(219,234,254) : Color(255,255,255));
     if (selected) g.FillPath(&fill, &path);
@@ -1373,46 +1854,99 @@ static void DrawLogMenuItem(const DRAWITEMSTRUCT* draw) {
     DeleteObject(font);
 }
 
+static int VisibleLogLines() {
+    int lineHeight = LogLineHeight();
+    RECT client{};
+    if (!logEdit || lineHeight <= 0 || !GetClientRect(logEdit, &client)) return 1;
+    int visible = client.bottom / lineHeight;
+    return visible > 0 ? visible : 1;
+}
+
 static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
     switch (message) {
     case WM_CONTEXTMENU: ShowLogMenu(hwnd, lp); return 0;
+    // A control without scroll bar styles ignores the wheel, so the launcher scrolls it. How far one
+    // notch goes is the user's own setting.
+    case WM_MOUSEWHEEL: {
+        UINT perNotch = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &perNotch, 0);
+        int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+        int step = perNotch == WHEEL_PAGESCROLL ? VisibleLogLines() : (int)perNotch;
+        if (notches && step > 0) {
+            SendMessageW(hwnd, EM_LINESCROLL, 0, -notches * step);
+            InvalidateLogBars();
+        }
+        return 0;
+    }
     case WM_KEYDOWN:
         // The stock edit menu is gone, so select-all has to be provided here. The async
         // state covers key messages that were posted rather than generated by real input.
         if (wp == 'A' && ((GetKeyState(VK_CONTROL) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000))) {
             SendMessageW(hwnd, EM_SETSEL, 0, (LPARAM)-1);
-            UpdateLogScrollBar();
             return 0;
         }
         break;
-    case WM_MOUSEMOVE:
-        break;   // hover is polled by the timer, which also covers the scrollbar
-    case WM_MOUSELEAVE:
-        return 0;
-    case WM_LBUTTONUP:
     case WM_KEYUP:
-        UpdateLogScrollBar();
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+        // The caret moving can scroll the view sideways without the launcher asking, so the tracked
+        // offset is refreshed from the control itself.
         break;
     }
-    return DefSubclassProc(hwnd, message, wp, lp);
+    LRESULT result = DefSubclassProc(hwnd, message, wp, lp);
+    switch (message) {
+    case WM_KEYUP:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+        SyncLogHorizontalOffset();
+        InvalidateLogBars();
+        break;
+    }
+    return result;
 }
 
 // Single place that defines the log control, so the behaviour under test is the same
 // one the window creates.
 static int Scaled(int n);
 static void CreateLogEdit(HWND parent) {
+    // No WS_VSCROLL/WS_HSCROLL: the launcher draws and drives its own bars, so the control has no
+    // non-client strip and the text box can use the whole panel. WS_CLIPSIBLINGS still matters,
+    // because the bars are siblings that sit on top of this control.
     logEdit = CreateWindowExW(0,L"EDIT",L"",
-        WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|ES_AUTOHSCROLL|ES_NOHIDESEL,
+        WS_CHILD|WS_CLIPSIBLINGS|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|ES_AUTOHSCROLL|ES_NOHIDESEL,
         0,0,0,0,parent,nullptr,GetModuleHandleW(nullptr),nullptr);
-    HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
+    // Ask for NSimSun with plain pitch flags: SimSun's family bits are not "fixed pitch", so asking
+    // for fixed pitch would make Windows substitute a different font. If the face is not there, fall
+    // back to Consolas rather than let GDI pick something proportional.
+    auto makeFont = [](const wchar_t* face) {
+        return CreateFontW(-Scaled(logFontHeight),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,face);
+    };
+    HFONT font = makeFont(logFontFace);
+    {
+        HDC dc = GetDC(logEdit);
+        if (dc) {
+            HGDIOBJ previous = SelectObject(dc, font);
+            wchar_t face[64]{};
+            GetTextFaceW(dc, 64, face);
+            if (previous) SelectObject(dc, previous);
+            ReleaseDC(logEdit, dc);
+            // A missing family comes back with a different name; the localised name is accepted too.
+            if (wcscmp(face, logFontFace) != 0 && wcscmp(face, L"\u65B0\u5B8B\u4F53") != 0 &&
+                wcscmp(face, L"\u5B8B\u4F53") != 0) {
+                DeleteObject(font);
+                font = makeFont(logFontFallback);
+            }
+        }
+    }
     SendMessageW(logEdit,WM_SETFONT,(WPARAM)font,TRUE);
     logBackground = CreateSolidBrush(RGB(255,255,255));
     SetWindowSubclass(logEdit, LogEditProc, 1, 0);
     // A multiline edit defaults to a 30k character limit; the line cap is the only limit
     // this box should have, otherwise appends fail silently once it is hit.
     SendMessageW(logEdit, EM_SETLIMITTEXT, 0, 0);
-    ShowScrollBar(logEdit, SB_VERT, FALSE);
+    // The bars come last so they sit above the edit and hide the system bars it keeps underneath.
+    CreateLogBars(parent);
 }
 
 // ---------------------------------------------------------------- tray icon
@@ -1517,14 +2051,14 @@ static void Layout() {
     if (!systemCorners)
         SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height, Scaled(12), Scaled(12)), TRUE);
     if (logEdit) {
-        SetWindowPos(logEdit, nullptr, Scaled(20), Scaled(53), Scaled(W - 40), Scaled(157), SWP_NOZORDER | SWP_NOACTIVATE);
-        ShowWindow(logEdit, (expanded && !mini) ? SW_SHOW : SW_HIDE);
-        if (expanded && !mini) SetTimer(windowHandle, logHoverTimer, logHoverIntervalMs, nullptr);
-        else {
-            KillTimer(windowHandle, logHoverTimer);
-            logHovered = false;
+        SetWindowPos(logEdit, nullptr, Scaled(logSide), Scaled(logTop), Scaled(logEditWidth), Scaled(logEditHeight), SWP_NOZORDER | SWP_NOACTIVATE);
+        bool show = expanded && !mini;
+        ShowWindow(logEdit, show ? SW_SHOW : SW_HIDE);
+        if (logVerticalBar) {
+            PositionLogBars();
+            ShowWindow(logVerticalBar, show ? SW_SHOW : SW_HIDE);
+            ShowWindow(logHorizontalBar, show ? SW_SHOW : SW_HIDE);
         }
-        UpdateLogScrollBar();
     }
     InvalidateRect(windowHandle, nullptr, TRUE);
 }
@@ -1534,8 +2068,6 @@ static void ToggleMini() {
     mini = !mini;
     if (mini) ExpandLog(false);
     Layout();
-    // the log is hidden while folded, so a stale hover state must not keep the bar alive
-    if (mini) { logHovered = false; UpdateLogScrollBar(); }
     AppendLog(mini ? L"已折叠为图标模式，双击鲸鱼图标可展开。"
                    : L"已展开全部按钮。");
 }
@@ -1549,6 +2081,26 @@ static Button Hit(int x, int y) {
     if (minRect.contains(x,y)) return Button::Minimize;
     if (closeRect.contains(x,y)) return Button::Close;
     return Button::None;
+}
+
+// Only the button whose hover state changed has to be redrawn. Repainting the whole window for that
+// was wasted work, and it is what made the mouse crossing the buttons show up over the log at all —
+// the reader reported that flicker and it stopped once this became a per-button repaint.
+static void InvalidateButton(Button button) {
+    UiRect ui{};
+    switch (button) {
+    case Button::Log: ui = logRect; break;
+    case Button::Status: ui = statusRect; break;
+    case Button::Start: ui = startRect; break;
+    case Button::Update: ui = updateRect; break;
+    case Button::Topmost: ui = topRect; break;
+    case Button::Minimize: ui = minRect; break;
+    case Button::Close: ui = closeRect; break;
+    default: return;
+    }
+    // One pixel of padding for the border, which is drawn just outside the button itself.
+    RECT rect{Scaled(ui.x) - 1, Scaled(ui.y) - 1, Scaled(ui.x + ui.w) + 1, Scaled(ui.y + ui.h) + 1};
+    InvalidateRect(windowHandle, &rect, FALSE);
 }
 
 static Color ColorForStatus() {
@@ -1655,7 +2207,7 @@ static void Paint() {
     g.DrawLine(&cross,closeRect.x + 16,19,closeRect.x + 8,29);
     }   // end of the buttons-only block
     if (expanded && !mini) {
-        GraphicsPath logBox; Rounded(logBox,14.5f,48.5f,(float)(W - 29),165,controlCornerRadius); Pen logBorder(Color(221,228,238),1);
+        GraphicsPath logBox; Rounded(logBox,logBoxSide,logBoxTop,(float)(W - 2 * logBoxSide),logBoxHeight,controlCornerRadius); Pen logBorder(Color(221,228,238),1);
         g.DrawPath(&logBorder,&logBox);
     }
     g.Flush();
@@ -1804,10 +2356,16 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_MOUSEMOVE: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
-        Button hit=Hit(x,y); if(hit!=hoverButton){hoverButton=hit;InvalidateRect(hwnd,nullptr,FALSE);}
+        Button hit=Hit(x,y);
+        if(hit!=hoverButton){
+            Button previous=hoverButton; hoverButton=hit;
+            InvalidateButton(previous); InvalidateButton(hoverButton);
+        }
         TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE,hwnd,0}; TrackMouseEvent(&tme); return 0;
     }
-    case WM_MOUSELEAVE: hoverButton=Button::None; InvalidateRect(hwnd,nullptr,FALSE); return 0;
+    case WM_MOUSELEAVE: {
+        Button previous=hoverButton; hoverButton=Button::None; InvalidateButton(previous); return 0;
+    }
     case WM_LBUTTONDOWN: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
         OnClick(Hit(x,y));   // dragging is handled through WM_NCHITTEST/HTCAPTION
@@ -1818,9 +2376,6 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if(iconRect.contains(x,y)) ToggleMini();
         return 0;
     }
-    case WM_TIMER:
-        if (wp == logHoverTimer) { UpdateLogHover(); return 0; }
-        break;
     case WM_LOG: {
         std::unique_ptr<std::wstring> line((std::wstring*)lp);
         if(!closing) AppendLog(*line); return 0;
@@ -2007,8 +2562,11 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
     // minimum tracking size (~136 px), which is wider than the icon and the lamp.
     // WS_EX_TOOLWINDOW keeps this floating widget out of the taskbar and out of the
     // Alt+Tab list; a tool window is still restored by launching the exe again.
+    // WS_CLIPCHILDREN matters: the buttons repaint the window whenever the pointer moves over
+    // them, and without this the window's paint covers the log box and its bars too, which are
+    // then repainted a moment later — that is the flicker the reader sees.
     HWND hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,wc.lpszClassName,L"DeepSeek Harness 启动器",
-        WS_POPUP|WS_SYSMENU|WS_MINIMIZEBOX,x,y,width,height,nullptr,nullptr,instance,nullptr);
+        mainWindowStyle,x,y,width,height,nullptr,nullptr,instance,nullptr);
     if(!hwnd) return 1;
     SetWindowPos(hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
     // Shown by default; the tray icon is still there for "hide to tray" and the menu.

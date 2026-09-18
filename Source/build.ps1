@@ -1,4 +1,4 @@
-param([string]$OutputDirectory = 'dist')
+param([string]$OutputDirectory = 'Out')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $out = Join-Path $root $OutputDirectory

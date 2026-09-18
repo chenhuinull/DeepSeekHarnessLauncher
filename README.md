@@ -6,7 +6,7 @@ Windows 桌面启动器，提供启动/停止、更新、窗口始终置顶及�
 
 启动器打开时位于主屏幕工作区中央。
 
-日志默认收起；启动失败时自动展开，服务启动成功时自动收起。也可以随时点击标题栏的“日志”手动切换。日志框内部为白底深色字，且不自动换行；内容超过一屏时，右侧滚动条只在鼠标移入日志框或存在选中内容时出现，其余时间隐藏。日志最多保留 5 万行，超出后自动丢弃最早的行。按 Ctrl+A 全选。右键菜单只有“复制”和“清除”两项：复制当前选中的内容（没有选中时该项为灰色），清除则清空日志框；剪切、粘贴等编辑项不会出现。
+日志默认收起；启动失败时自动展开，服务启动成功时自动收起。也可以随时点击标题栏的“日志”手动切换。日志框内部为白底深色字，且不自动换行；右侧和下方各有一根细滚动条，只画出滑块本身——没有轨道底色、没有两端箭头，长行可以直接横向拖动查看。这两根滚动条由启动器自己绘制、自己驱动：编辑控件不带系统滚动条样式，所以没有任何非客户区被占用，文字区因此比原来多出约 13×13 像素。滚动所需的数据也由启动器自己测量（行数、行高、首个可见行，以及**最宽一行的像素宽度**与横向偏移），拖动、滚轮和键盘翻页都可用，滚轮步长遵循系统设置。日志用新宋体（NSimSun）12px：它同时自带中文与西文字形，汉字是正方形的；之前用 Consolas 时汉字要靠字体链接借用别的字体、被塞进西文字格里，看起来偏扁。横向滚动条也因此按像素测量行宽——一个汉字顶两个西文字符宽。机器上没有新宋体时回退到 Consolas。两根滚动条是编辑控件的兄弟窗口，压在它上面，所以两者都带 `WS_CLIPSIBLINGS`——否则控件重绘时会盖到滚动条上。日志最多保留 5 万行，超出后自动丢弃最早的行。每条日志的分隔符加在行首、末尾不留换行，所以最新一行就贴在框底，框子底部不会空出一行的位置。按 Ctrl+A 全选。右键菜单只有“复制”和“清除”两项：复制当前选中的内容（没有选中时该项为灰色），清除则清空日志框；剪切、粘贴等编辑项不会出现。
 
 鲸鱼图标旁的状态点：绿色表示已启动（包括接管的外部服务），黄色表示未启动，红色表示未安装 DeepSeek Harness，紫色表示未启动且有更新，橙色表示进程还在但 Web 服务已经没有应答。悬停状态点可查看说明。
 
@@ -18,13 +18,26 @@ DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favico
 
 ## 使用
 
-发布原生 Win32 单文件版本需要 Windows 和 Visual Studio 的“使用 C++ 的桌面开发”组件。双击项目根目录的 `publish.cmd` 即可编译发布；命令行也可运行：
+发布原生 Win32 单文件版本需要 Windows 和 Visual Studio 的“使用 C++ 的桌面开发”组件。双击项目根目录的 `Build.cmd` 即可编译；命令行也可运行：
 
 ```powershell
-.\publish.cmd --no-pause
+.\Build.cmd --no-pause
+```
+
+目录结构：`Source\` 放源码（`launcher.cpp` 启动器本体、`build.ps1` 编译脚本、`launcher.rc` 图标资源、`version_parse_test.cpp` 回归检查），`Out\` 放编译产物，其中 `Out\DeepSeekHarnessLauncher.exe` 是直接可用的发布版，随源码一起入库。回归检查用 VS 开发者命令行编译后运行（`Source\version_parse_test.cpp` 顶部注释里有完整命令）：
+
+```powershell
+cl /nologo /std:c++20 /utf-8 /O1 /MT /EHsc /DUNICODE /D_UNICODE /Fe:version_parse_test.exe ^
+   version_parse_test.cpp user32.lib gdi32.lib gdiplus.lib dwmapi.lib shell32.lib ole32.lib ^
+   uuid.lib comctl32.lib iphlpapi.lib ws2_32.lib winhttp.lib bcrypt.lib advapi32.lib version.lib
+.\version_parse_test.exe            # 逻辑与界面行为检查
+.\version_parse_test.exe --screen   # 额外的屏幕级检查（会在右下角短暂显示一个小窗口）
+.\version_parse_test.exe --discover # 查看本机的 Node.js / npm 探测结果
 ```
 
 首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时由启动器自己下载 Windows x64 的 Node.js ZIP 并校验 SHA-256，解压到本地工具目录。下载在启动器进程内用 WinHTTP 完成，解压调用系统自带的 `tar.exe`，**不依赖 Windows PowerShell**。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web --no-open`。以后启动会复用这些本地文件，不需要重复下载。浏览器由启动器决定是否打开：读取 dsh 打印的地址后，先看浏览器里是否已经有 DeepSeek Harness 页面（按窗口标题精确匹配 `DeepSeek Harness`），已经打开就不重复开新标签页，没有才用默认浏览器打开带访问令牌的本地地址；地址随时可从运行日志复制。页面使用持久化的浏览器会话凭据，服务重启后已打开的页面依然可用。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
+
+启动器会检测并记录实际使用的 Node.js 与 npm 版本（例如“使用系统 Node.js v24.16.0 和 npm v11.17.0。”），而不是只判断文件是否存在。系统 Node.js 自带的 npm 往往比 PATH 上的全局 npm 旧（npm 11.13 不认识 `allow-scripts` 之类的 .npmrc 键，11.17 才认识），新旧 npm 对同一份配置和输出会有不同反应，因此会在私有运行时、`node.exe` 所在目录和 PATH 上所有目录中挑选**版本最高且与所选 Node.js 同属一个大版本**的 npm 并在日志中说明替换原因；不跨大版本升级，避免新 npm 要求比当前 Node.js 更新的运行时。
 
 首次安装使用启动器内置的已知可用版本（Node.js `24.16.0`、`@deepseek-ai/dsh@0.1.5-rc.2`），因此同一份 exe 在任何机器上装出的结果一致。需要更新时点“更新”查询并安装 npm 上的最新版；服务成功启动过的版本会记入 `known-good.txt`，若新版本启动失败，“更新”按钮会变成橙色，一键装回上一个可用版本。
 
@@ -36,4 +49,4 @@ DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favico
 
 “更新”按钮查询 npm 最新版本，20 秒未完成会结束查询并恢复按钮；发现新版后按钮底色变为紫色，再次点击即可更新（更新前需停止服务）。本机还没有 Node.js 与 npm 时，“更新”不会为了查询版本号而下载运行时，只会提示先点“启动”。服务成功启动过的版本会记入 `known-good.txt`，若新版本启动失败，按钮底色变为橙色，点击即装回上一个可用版本。
 
-发布结果仅有 `dist\DeepSeekHarnessLauncher.exe`。目标 Windows 电脑无需预装 .NET、MFC、Visual C++ 运行库、Node.js 或 PowerShell；若缺少 Node.js 和 npm，首次使用需要联网下载，解压依赖 Windows 10 1803 及以上自带的 `tar.exe`。
+编译结果仅有 `Out\DeepSeekHarnessLauncher.exe`（源码在 `Source\`）。目标 Windows 电脑无需预装 .NET、MFC、Visual C++ 运行库、Node.js 或 PowerShell；若缺少 Node.js 和 npm，首次使用需要联网下载，解压依赖 Windows 10 1803 及以上自带的 `tar.exe`。
