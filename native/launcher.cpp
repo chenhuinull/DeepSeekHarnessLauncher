@@ -1334,13 +1334,102 @@ static void CreateLogEdit(HWND parent) {
     ShowScrollBar(logEdit, SB_VERT, FALSE);
 }
 
+// ---------------------------------------------------------------- tray icon
+
+static constexpr UINT WM_TRAYICON = WM_APP + 20;
+static constexpr UINT trayIconId = 1;
+static NOTIFYICONDATAW trayIconData{};
+static bool trayIconAdded = false;
+static UINT taskbarCreatedMessage = 0;
+static void OnClick(Button button);
+
+static std::wstring StatusName() {
+    switch (status) {
+    case State::Running: return L"已启动";
+    case State::Stopped: return L"未启动";
+    case State::Update: return L"未启动，有更新";
+    case State::Unresponsive: return L"已启动，服务无响应";
+    default: return L"未安装固件";
+    }
+}
+
+static void AddTrayIcon() {
+    if (!windowHandle) return;
+    trayIconData = {};
+    trayIconData.cbSize = sizeof(trayIconData);
+    trayIconData.hWnd = windowHandle;
+    trayIconData.uID = trayIconId;
+    trayIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    trayIconData.uCallbackMessage = WM_TRAYICON;
+    trayIconData.hIcon = appIcon ? appIcon : LoadIconW(nullptr, IDI_APPLICATION);
+    std::wstring tip = L"DeepSeek Harness 启动器 · " + StatusName();
+    wcsncpy_s(trayIconData.szTip, tip.c_str(), _TRUNCATE);
+    trayIconAdded = Shell_NotifyIconW(NIM_ADD, &trayIconData) != FALSE;
+}
+
+static void UpdateTrayTip() {
+    if (!trayIconAdded) return;
+    std::wstring tip = L"DeepSeek Harness 启动器 · " + StatusName();
+    wcsncpy_s(trayIconData.szTip, tip.c_str(), _TRUNCATE);
+    trayIconData.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &trayIconData);
+}
+
+static void RemoveTrayIcon() {
+    if (!trayIconAdded) return;
+    trayIconAdded = false;
+    Shell_NotifyIconW(NIM_DELETE, &trayIconData);
+}
+
+static void ShowTrayBalloon(const std::wstring& title, const std::wstring& text) {
+    if (!trayIconAdded) return;
+    wcsncpy_s(trayIconData.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(trayIconData.szInfo, text.c_str(), _TRUNCATE);
+    trayIconData.dwInfoFlags = NIIF_INFO;
+    trayIconData.uFlags = NIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &trayIconData);
+}
+
+static void ShowLauncherWindow() {
+    if (IsIconic(windowHandle)) ShowWindow(windowHandle, SW_RESTORE);
+    ShowWindow(windowHandle, SW_SHOW);
+    SetWindowPos(windowHandle, topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(windowHandle);
+}
+
+static void HideLauncherWindow() { ShowWindow(windowHandle, SW_HIDE); }
+static void ToggleLauncherWindow() {
+    if (IsWindowVisible(windowHandle)) HideLauncherWindow();
+    else ShowLauncherWindow();
+}
+
+static void ShowTrayMenu() {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, 1, IsWindowVisible(windowHandle) ? L"隐藏窗口" : L"显示窗口");
+    AppendMenuW(menu, MF_STRING, 2, serverRunning ? L"停止服务" : L"启动服务");
+    if (busy) EnableMenuItem(menu, 2, MF_BYCOMMAND | MF_GRAYED);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 3, L"退出启动器");
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    if (IsWindowVisible(windowHandle)) SetForegroundWindow(windowHandle);
+    int command = (int)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        cursor.x, cursor.y, 0, windowHandle, nullptr);
+    DestroyMenu(menu);
+    PostMessageW(windowHandle, WM_NULL, 0, 0);
+    if (command == 1) ToggleLauncherWindow();
+    else if (command == 2) OnClick(Button::Start);      // same path as the window button
+    else if (command == 3) DestroyWindow(windowHandle);
+}
+
 static void SetStatus(State state, const std::wstring& detail) {
     status = state;
-    std::wstring name = state == State::Running ? L"已启动" : state == State::Stopped ? L"未启动" :
-        state == State::Update ? L"未启动，有更新" :
-        state == State::Unresponsive ? L"已启动，服务无响应" : L"未安装固件";
+    std::wstring name = StatusName();
     statusTip = name + L" · " + detail;
     if (tooltip) { tipInfo.lpszText = statusTip.data(); SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&tipInfo); }
+    UpdateTrayTip();
     InvalidateRect(windowHandle, nullptr, FALSE);
 }
 
@@ -1514,7 +1603,10 @@ static void OnClick(Button button) {
         SetWindowPos(windowHandle,topmost ? HWND_TOPMOST : HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);
         AppendLog(topmost ? L"已开启窗口始终置顶。" : L"已关闭窗口始终置顶。");
         InvalidateRect(windowHandle,nullptr,FALSE); break;
-    case Button::Minimize: ShowWindow(windowHandle,SW_MINIMIZE); break;
+    case Button::Minimize:
+        AppendLog(L"已最小化到托盘，点击托盘图标可重新打开窗口。");
+        HideLauncherWindow();
+        break;
     case Button::Close: DestroyWindow(windowHandle); break;
     default: break;
     }
@@ -1701,11 +1793,23 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if(failed) ExpandLog(true);
         stopping=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
     }
+    case WM_TRAYICON:
+        switch (LOWORD(lp)) {
+        case WM_LBUTTONUP: ToggleLauncherWindow(); break;
+        case WM_LBUTTONDBLCLK: ShowLauncherWindow(); break;
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU: ShowTrayMenu(); break;
+        }
+        return 0;
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
     case WM_DESTROY:
-        closing=true; KillJob(workJob);
+        closing=true; KillJob(workJob); RemoveTrayIcon();
         if (logBackground) { DeleteObject(logBackground); logBackground = nullptr; }
         PostQuitMessage(0); return 0;
+    default:
+        // Explorer restarted: the tray icon has to be put back.
+        if (taskbarCreatedMessage && message == taskbarCreatedMessage) { AddTrayIcon(); return 0; }
+        break;
     }
     return DefWindowProcW(hwnd,message,wp,lp);
 }
@@ -1719,6 +1823,8 @@ static bool ActivateExistingInstance() {
         if (!existing) Sleep(100);
     }
     if (!existing) return false;
+    // The launcher may be sitting in the tray, which is just a hidden window.
+    ShowWindow(existing, SW_SHOW);
     if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
     // Windows only lets the foreground process hand over the foreground, and a launcher
     // started from Explorer or a shortcut does not own it: attach to the foreground
@@ -1769,7 +1875,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
         WS_POPUP|WS_SYSMENU|WS_MINIMIZEBOX,x,y,width,height,nullptr,nullptr,instance,nullptr);
     if(!hwnd) return 1;
     SetWindowPos(hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
-    ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
+    // Starts in the tray: the window stays hidden until the icon is clicked. The balloon
+    // is the only hint that it is running, since there is no taskbar button either.
+    taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    AddTrayIcon();
+    ShowTrayBalloon(L"DeepSeek Harness 启动器", L"已在托盘运行。点击托盘图标打开窗口，右键显示菜单。");
+    UpdateWindow(hwnd);
     MSG message;
     while(GetMessageW(&message,nullptr,0,0)>0){TranslateMessage(&message);DispatchMessageW(&message);}
     GdiplusShutdown(gdiplusToken);
