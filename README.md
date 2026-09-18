@@ -24,7 +24,7 @@ DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favico
 .\publish.cmd --no-pause
 ```
 
-首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时由启动器自己下载 Windows x64 的 Node.js ZIP 并校验 SHA-256，解压到本地工具目录。下载在启动器进程内用 WinHTTP 完成，解压调用系统自带的 `tar.exe`，**不依赖 Windows PowerShell**。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web`。以后启动会复用这些本地文件，不需要重复下载。默认浏览器会打开带访问令牌的本地地址；也可从运行日志复制完整地址。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
+首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时由启动器自己下载 Windows x64 的 Node.js ZIP 并校验 SHA-256，解压到本地工具目录。下载在启动器进程内用 WinHTTP 完成，解压调用系统自带的 `tar.exe`，**不依赖 Windows PowerShell**。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web --no-open`。以后启动会复用这些本地文件，不需要重复下载。浏览器由启动器决定是否打开：读取 dsh 打印的地址后，先看浏览器里是否已经有 DeepSeek Harness 页面（按窗口标题精确匹配 `DeepSeek Harness`），已经打开就不重复开新标签页，没有才用默认浏览器打开带访问令牌的本地地址；地址随时可从运行日志复制。页面使用持久化的浏览器会话凭据，服务重启后已打开的页面依然可用。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。
 
 首次安装使用启动器内置的已知可用版本（Node.js `24.16.0`、`@deepseek-ai/dsh@0.1.5-rc.2`），因此同一份 exe 在任何机器上装出的结果一致。需要更新时点“检查更新”，再点“安装更新”装 npm 上的最新版；服务成功启动过的版本会记入 `known-good.txt`，若新版本启动失败，按钮会变成“回退到 <版本>”，一键装回上一个可用版本。
 

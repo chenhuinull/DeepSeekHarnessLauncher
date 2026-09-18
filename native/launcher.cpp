@@ -9,6 +9,7 @@
 #include <commctrl.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <tlhelp32.h>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -764,6 +765,62 @@ static HANDLE OpenLiveServer(ServerIdentity id) {
     return process;
 }
 
+// Kills a process and everything below it. Walking the tree is used instead of relying on
+// the job object alone, because a launcher that was itself started from inside the
+// service's process tree is a member of that job: TerminateJobObject would then kill the
+// launcher too, which looks exactly like a crash.
+static bool TerminateProcessTree(DWORD pid) {
+    if (!pid || pid == GetCurrentProcessId()) return false;
+    std::vector<std::pair<DWORD, DWORD>> links;
+    if (HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+        if (Process32FirstW(snapshot, &entry)) {
+            do { links.emplace_back(entry.th32ParentProcessID, entry.th32ProcessID); }
+            while (Process32NextW(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+    std::vector<DWORD> descendants, pending{pid};
+    while (!pending.empty()) {
+        DWORD parent = pending.back(); pending.pop_back();
+        for (const auto& link : links) {
+            DWORD child = link.second;
+            if (link.first != parent || child == GetCurrentProcessId()) continue;
+            if (std::find(descendants.begin(), descendants.end(), child) != descendants.end()) continue;
+            if (std::find(pending.begin(), pending.end(), child) != pending.end()) continue;
+            descendants.push_back(child);
+            pending.push_back(child);
+        }
+    }
+    for (auto it = descendants.rbegin(); it != descendants.rend(); ++it) {
+        if (HANDLE child = OpenProcess(PROCESS_TERMINATE, FALSE, *it)) {
+            TerminateProcess(child, 1);
+            CloseHandle(child);
+        }
+    }
+    bool killed = false;
+    if (HANDLE root = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
+        killed = !!TerminateProcess(root, 1);
+        CloseHandle(root);
+    }
+    return killed;
+}
+
+static bool TerminateServer(ServerIdentity id) {
+    bool useJob = false;
+    {
+        std::lock_guard lock(processMutex);
+        BOOL selfInJob = FALSE;
+        useJob = serverJob && !serverExternal &&
+            IsProcessInJob(GetCurrentProcess(), serverJob, &selfInJob) && !selfInJob;
+        if (useJob) return !!TerminateJobObject(serverJob, 1);
+    }
+    HANDLE live = OpenLiveServer(id);   // refuse to kill a recycled pid
+    if (!live) return false;
+    CloseHandle(live);
+    return TerminateProcessTree(id.pid);
+}
+
 static void ReadServerLog(unsigned long long& offset, std::string& pending) {
     HANDLE file = CreateFileW(ServerLogFile().c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -782,7 +839,7 @@ static void ReadServerLog(unsigned long long& offset, std::string& pending) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
             PostLog(Utf8(line));
-            if (line.find("dsh web: http") != std::string::npos && !closing)
+            if (line.find("dsh web: http") != std::string::npos && !closing && !serverReady)
                 PostMessageW(windowHandle, WM_SERVER_READY, 0, 0);
         }
         if (pending.size() > 65536) { PostLog(Utf8(pending)); pending.clear(); }
@@ -855,7 +912,7 @@ static DWORD RunServer(const std::wstring& node) {
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = nullInput; si.hStdOutput = logFile; si.hStdError = logFile;
-    std::wstring cmd = Quote(node) + L" " + Quote(EntryPoint().wstring()) + L" web";
+    std::wstring cmd = Quote(node) + L" " + Quote(EntryPoint().wstring()) + L" web --no-open";
     std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end()); mutableCmd.push_back(0);
     HANDLE job = CreateJobObjectW(nullptr, serverJobName);
     PROCESS_INFORMATION pi{};
@@ -1155,6 +1212,59 @@ static void AppendLog(const std::wstring& line) {
     UpdateLogScrollBar();
 }
 
+// dsh is started with --no-open, so the launcher decides: it reads the URL dsh printed
+// and only opens a browser when no page is showing the UI already. The page keeps a
+// persistent browser-session cookie, so an already open tab survives a service restart.
+static std::wstring FindServerUrl() {
+    std::ifstream file(ServerLogFile(), std::ios::binary);
+    if (!file) return {};
+    std::string text((std::istreambuf_iterator<char>(file)), {});
+    std::wstring url;
+    size_t position = 0;
+    while ((position = text.find("dsh web: http", position)) != std::string::npos) {
+        size_t start = position + 9;
+        size_t end = text.find_first_of(" \t\r\n", start);
+        url = Utf8(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        position = end == std::string::npos ? text.size() : end;
+    }
+    return url;
+}
+
+// The UI sets its title to "<session title> — DeepSeek Harness" (or plain "DeepSeek
+// Harness" before a session exists), and browsers append their own suffixes when several
+// tabs are open, so the product name has to be matched inside the window title. A
+// background tab still hides itself from this check: a browser window only carries the
+// title of its active tab.
+static bool TitleLooksLikeHarnessPage(const std::wstring& title) {
+    return title.find(L"DeepSeek Harness") != std::wstring::npos;
+}
+
+static bool HarnessPageOpen() {
+    bool found = false;
+    EnumWindows([](HWND window, LPARAM parameter) -> BOOL {
+        if (!IsWindowVisible(window)) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(window, &pid);
+        if (pid == GetCurrentProcessId()) return TRUE;   // never our own window
+        wchar_t title[512]{};
+        if (GetWindowTextW(window, title, 512) <= 0) return TRUE;
+        if (TitleLooksLikeHarnessPage(title)) { *(bool*)parameter = true; return FALSE; }
+        return TRUE;
+    }, (LPARAM)&found);
+    return found;
+}
+
+static void OpenBrowserIfNoPage() {
+    if (HarnessPageOpen()) {
+        AppendLog(L"浏览器中已打开 DeepSeek Harness 页面，未重复打开新标签页。");
+        return;
+    }
+    std::wstring url = FindServerUrl();
+    if (url.empty()) return;
+    ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    AppendLog(L"已在默认浏览器中打开 " + url);
+}
+
 // The log box offers only what makes sense for a read-only log: copy the selection
 // and clear the box. The stock edit menu (cut/paste/undo/select all) is suppressed.
 static void ShowLogMenu(HWND owner, LPARAM screenPosition) {
@@ -1369,20 +1479,7 @@ static void OnClick(Button button) {
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST) != IDYES) break;
             }
             stopping = true; busy = true;
-            bool terminated = false;
-            {
-                std::lock_guard lock(processMutex);
-                if (!serverExternal && serverJob) terminated = !!TerminateJobObject(serverJob, 1);
-            }
-            if (!terminated) {
-                HANDLE process = OpenLiveServer(id);
-                if (process) { terminated = !!TerminateProcess(process, 1); CloseHandle(process); }
-            }
-            if (!terminated) {
-                std::lock_guard lock(processMutex);
-                if (serverJob) terminated = !!TerminateJobObject(serverJob, 1);
-            }
-            if (terminated) SetStatus(State::Stopped,L"正在关闭 Web 服务…");
+            if (TerminateServer(id)) SetStatus(State::Stopped,L"正在关闭 Web 服务…");
             else { busy = false; stopping = false; AppendLog(L"停止失败：无法结束 Web 服务进程。"); }
         } else { serverReady = false; BeginWork(Work::Start); }
         break;
@@ -1430,7 +1527,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             attached?L"检测到正在运行的 DeepSeek Harness Web 服务。":
             (Installed()?L"点击“启动”运行 DeepSeek Harness。":L"点击“启动”自动安装 DeepSeek Harness。"));
         AppendLog(L"启动器已就绪。首次启动会按需下载工具并安装 DeepSeek Harness，可能需要几分钟。");
-        if (attached) AppendLog(L"检测到已运行的 DeepSeek Harness，可以点击“停止”结束服务。");
+        if (attached) {
+            AppendLog(L"检测到已运行的 DeepSeek Harness，可以点击“停止”结束服务。");
+            OpenBrowserIfNoPage();
+        }
         return 0;
     }
     case WM_PAINT: Paint(); return 0;
@@ -1512,7 +1612,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         serverReady=true;
         if(!serverExternal) SaveKnownGoodVersion(Version());
         rollbackVersion.clear(); updateLabel=L"检查更新";
-        SetStatus(State::Running,L"Web 服务已就绪；浏览器将自动打开，访问地址见运行日志。");
+        SetStatus(State::Running,L"Web 服务已就绪；访问地址见运行日志。");
+        OpenBrowserIfNoPage();
         ExpandLog(false); return 0;
     case WM_SERVER_UNHEALTHY:
         if (!serverRunning) return 0;
