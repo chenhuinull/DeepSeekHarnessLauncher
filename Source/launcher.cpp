@@ -59,6 +59,9 @@ static const wchar_t* const logFontFallback = L"Consolas";
 static constexpr int buttonWidth = 46, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
 // The status control is a lamp only, so it stays as narrow as a square indicator.
 static constexpr int indicatorWidth = 28;
+// The lit part of the lamp. It was 10px inside the 28px button, which read as a small dot in the
+// middle of a lot of white; the reader asked for a bigger one.
+static constexpr int lampDotDiameter = 15;
 // The title bar reads [close][minimize], then the launcher's own buttons, and ends with the lamp
 // sitting next to the whale. The reader asked for all three moves: the window buttons and the whale
 // traded places, then close and minimize swapped with each other, and the lamp came over to the whale.
@@ -2560,7 +2563,9 @@ static void Paint() {
     }
     DrawButton(g,LampRect(),L"",Button::Status);
     SolidBrush dot(ColorForStatus());
-    g.FillEllipse(&dot,LampRect().x + (indicatorWidth - 10) / 2,buttonTop + (buttonHeight - 10) / 2,10,10);
+    UiRect lamp = LampRect();
+    g.FillEllipse(&dot, lamp.x + (indicatorWidth - lampDotDiameter) / 2,
+        buttonTop + (buttonHeight - lampDotDiameter) / 2, lampDotDiameter, lampDotDiameter);
     if (!mini) {
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,logRect,L"日志",Button::Log);

@@ -834,6 +834,7 @@ static HICON MakeSolidIcon(int size, COLORREF color) {
 
 struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1,
                         dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1,
+                        lampFirstY = -1, lampLastY = -1,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int width, int height) {
@@ -870,12 +871,8 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                 ++seen.lamp;                      // the "not started" lamp, the one colour nothing else uses
                 if (seen.lampFirstX < 0 || x < seen.lampFirstX) seen.lampFirstX = x;
                 if (x > seen.lampLastX) seen.lampLastX = x;
-            } else if (std::abs((int)GetRValue(pixel) - 234) <= 25 &&
-                       std::abs((int)GetGValue(pixel) - 179) <= 30 &&
-                       std::abs((int)GetBValue(pixel) - 8) <= 40) {
-                ++seen.lamp;                      // the "not started" lamp, the one colour nothing else uses
-                if (seen.lampFirstX < 0 || x < seen.lampFirstX) seen.lampFirstX = x;
-                if (x > seen.lampLastX) seen.lampLastX = x;
+                if (seen.lampFirstY < 0 || y < seen.lampFirstY) seen.lampFirstY = y;
+                if (y > seen.lampLastY) seen.lampLastY = y;
             }
         }
     }
@@ -1131,6 +1128,16 @@ static void RunScreenChecks() {
             Check(seen.lamp > 0 && seen.lampFirstX > Scaled(W) / 2 && seen.lampLastX < seen.firstX &&
                   seen.firstX - seen.lampLastX <= Scaled(indicatorWidth),
                 "on screen: the lamp is drawn right beside the whale, both at the right end");
+            // The lamp's lit part, measured off the screen: it has to be the size that was asked for, and
+            // round rather than a blob, so both spans are checked.
+            std::printf("      lamp dot on screen: %dx%d px (asked for %d)\n",
+                seen.lampLastX - seen.lampFirstX + 1, seen.lampLastY - seen.lampFirstY + 1, Scaled(lampDotDiameter));
+            Check(seen.lampLastX - seen.lampFirstX + 1 >= Scaled(lampDotDiameter) - 1 &&
+                  seen.lampLastY - seen.lampFirstY + 1 >= Scaled(lampDotDiameter) - 1,
+                "on screen: the lamp dot is drawn at the bigger size that was asked for");
+            Check(seen.lampLastX - seen.lampFirstX <= seen.lampLastY - seen.lampFirstY + 1 &&
+                  seen.lampLastY - seen.lampFirstY <= seen.lampLastX - seen.lampFirstX + 1,
+                "on screen: the lamp dot is as wide as it is tall, so it is still a circle");
             // The bug this replaced: the pair's plate was derived from the minimize button, so once
             // close led the row the plate covered the left half of the start button and the divider
             // was drawn on the outside edge. Both are read off the screen here.
@@ -1630,6 +1637,11 @@ static int RunChecks(int argc, wchar_t** argv) {
     Check(cornerRadius == 3.0f, "one corner radius, tightened to 3px, is shared by everything round");
     Check(windowCornerEllipsePx == (int)(2 * cornerRadius),
         "the window region's corner ellipse is twice the painted radius, so shape and frame agree");
+    // The lit part of the lamp: bigger than the 10px dot it used to be, and still inside its button with
+    // a margin all round, or the lamp would look like a filled square of colour.
+    Check(lampDotDiameter > 10 && lampDotDiameter <= indicatorWidth - 6,
+        "the lamp dot is bigger than it was and still leaves a margin inside the lamp button");
+    Check(lampDotDiameter <= buttonHeight - 6, "the lamp dot fits the button's height too");
 
     // Folding: the window itself neither moves nor resizes any more. That is the point — a geometry
     // change is what made the compositor show the surface it already had at the new shape for a frame,
