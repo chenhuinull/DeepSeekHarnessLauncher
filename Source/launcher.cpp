@@ -1265,6 +1265,64 @@ static void SaveKnownGoodVersion(const std::wstring& version) {
     file.flush();
 }
 
+// Launcher settings that outlive a run. A small key=value file next to server.log rather than the
+// registry, so the launcher stays a folder you can look at: settings.ini holds nothing but the
+// toggles the reader flipped. A missing file, a missing key or an unreadable value keeps whatever
+// the launcher started with, and unknown keys are ignored so a newer build can add more.
+static fs::path SettingsFile() { return runtimeDir.parent_path() / L"settings.ini"; }
+
+static std::optional<bool> ParseSetting(const std::string& text, const std::string& key) {
+    size_t at = 0;
+    while (at <= text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t equals = line.find('=');
+        if (equals != std::string::npos && line.compare(0, equals, key) == 0) {
+            std::string value = line.substr(equals + 1);
+            while (!value.empty() && value.front() == ' ') value.erase(0, 1);
+            if (value == "1" || value == "true" || value == "yes") return true;
+            if (value == "0" || value == "false" || value == "no") return false;
+            return std::nullopt;
+        }
+        if (end == text.size()) break;
+        at = end + 1;
+    }
+    return std::nullopt;
+}
+
+static std::string FormatSettings(bool windowTopmost, bool restartAutomatically) {
+    return std::string("topmost=") + (windowTopmost ? "1" : "0") + "\n" +
+        "autoRestart=" + (restartAutomatically ? "1" : "0") + "\n";
+}
+
+static void SaveSettings() {
+    std::error_code error;
+    fs::create_directories(SettingsFile().parent_path(), error);
+    fs::path staging = SettingsFile().wstring() + L".tmp";
+    {
+        std::ofstream file(staging, std::ios::binary | std::ios::trunc);
+        if (!file) return;
+        file << FormatSettings(topmost, autoRestart);
+        file.flush();
+        if (!file) return;
+    }
+    // Replace rather than truncate in place: a half-written file would lose both toggles.
+    if (!MoveFileExW(staging.c_str(), SettingsFile().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        error.clear();
+        fs::remove(staging, error);
+    }
+}
+
+static void LoadSettings() {
+    std::ifstream file(SettingsFile(), std::ios::binary);
+    if (!file) return;
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (auto value = ParseSetting(text, "topmost")) topmost = *value;
+    if (auto value = ParseSetting(text, "autoRestart")) autoRestart = *value;
+}
+
 static std::wstring ExceptionMessage(const std::exception& e) {
     std::string what = e.what();
     if (what == "node download failed") return L"下载 Node.js 失败。请检查网络或代理后重试，也可自行安装 Node.js。";
@@ -2280,6 +2338,7 @@ static void ToggleAutoRestart() {
         autoRestartReadyAt = 0;
         AppendLog(L"已关闭自动重启。");
     }
+    SaveSettings();
     RefreshStatusTip();
     InvalidateRect(windowHandle, nullptr, FALSE);
 }
@@ -2508,6 +2567,7 @@ static void OnClick(Button button) {
         topmost = !topmost;
         SetWindowPos(windowHandle,topmost ? HWND_TOPMOST : HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);
         AppendLog(topmost ? L"已开启窗口始终置顶。" : L"已关闭窗口始终置顶。");
+        SaveSettings();
         InvalidateRect(windowHandle,nullptr,FALSE); break;
     case Button::Minimize:
         AppendLog(L"已最小化到托盘，点击托盘图标可重新打开窗口。");
@@ -2576,6 +2636,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             attached?L"检测到正在运行的 DeepSeek Harness Web 服务。":
             (Installed()?L"点击“启动”运行 DeepSeek Harness。":L"点击“启动”自动安装 DeepSeek Harness。"));
         AppendLog(L"启动器已就绪。首次启动会按需下载工具并安装 DeepSeek Harness，可能需要几分钟。");
+        if (autoRestart) AppendLog(L"自动重启已开启（上次退出前是开启的）：服务无响应或意外退出后会自动重新启动。");
         if (attached) {
             AppendLog(L"检测到已运行的 DeepSeek Harness，可以点击“停止”结束服务。");
             OpenBrowserIfNoPage();
@@ -2822,6 +2883,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
     GdiplusStartup(&gdiplusToken,&gdiplusInput,nullptr);
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES}; InitCommonControlsEx(&controls);
     runtimeDir=LocalAppData()/L"DeepSeekHarnessLauncher"/L"runtime";
+    LoadSettings();   // before the window exists, so a remembered "not always on top" is honoured
     HDC dc=GetDC(nullptr); scaleFactor=(float)GetDeviceCaps(dc,LOGPIXELSX)/96.f; ReleaseDC(nullptr,dc);
     WNDCLASSW wc{}; wc.lpfnWndProc=WindowProc; wc.hInstance=instance;
     wc.lpszClassName=L"DeepSeekHarnessLauncherNative"; wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
@@ -2839,9 +2901,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
     // WS_CLIPCHILDREN matters: the buttons repaint the window whenever the pointer moves over
     // them, and without this the window's paint covers the log box and its bars too, which are
     // then repainted a moment later — that is the flicker the reader sees.
-    HWND hwnd=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,wc.lpszClassName,L"DeepSeek Harness 启动器",
+    HWND hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|(topmost?WS_EX_TOPMOST:0),wc.lpszClassName,L"DeepSeek Harness 启动器",
         mainWindowStyle,x,y,width,height,nullptr,nullptr,instance,nullptr);
     if(!hwnd) return 1;
+    // The ex style is not enough on its own: a remembered "not on top" has to be pushed once the
+    // window exists, or the first show would still raise it above everything.
+    SetWindowPos(hwnd,topmost?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     SetWindowPos(hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
     // Shown by default; the tray icon is still there for "hide to tray" and the menu.
     taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");

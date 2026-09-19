@@ -1110,6 +1110,41 @@ static int RunChecks(int argc, wchar_t** argv) {
         status = State::Missing;
     }
 
+    // Settings outlive a run through settings.ini. The file format is checked here, including the
+    // rule that a missing key or an unreadable value leaves the current setting alone, plus a real
+    // save/load round trip in a temporary folder.
+    {
+        std::string text = "topmost=0\r\nautoRestart=1\nunknown=7\n";
+        Check(ParseSetting(text, "topmost") == std::optional<bool>(false), "a stored 0 is read back as off");
+        Check(ParseSetting(text, "autoRestart") == std::optional<bool>(true), "a stored 1 is read back as on");
+        Check(!ParseSetting(text, "unknown").has_value() && !ParseSetting(text, "missing").has_value(),
+            "a key the launcher does not know leaves the current setting alone");
+        Check(!ParseSetting("topmost=maybe\n", "topmost").has_value(), "an unreadable value is ignored");
+        std::string written = FormatSettings(false, true);
+        Check(ParseSetting(written, "topmost") == std::optional<bool>(false) &&
+              ParseSetting(written, "autoRestart") == std::optional<bool>(true),
+            "whatever the launcher writes, the launcher reads back");
+
+        fs::path savedRuntime = runtimeDir;
+        fs::path probeRuntime = fs::temp_directory_path() / L"dsh-settings-check" / L"runtime";
+        fs::remove_all(probeRuntime.parent_path());
+        runtimeDir = probeRuntime;
+        topmost = true; autoRestart = false;
+        SaveSettings();
+        Check(fs::exists(SettingsFile()), "saving writes settings.ini next to the runtime folder");
+        topmost = false; autoRestart = true;
+        LoadSettings();
+        Check(topmost && !autoRestart, "both toggles come back the way they were left");
+        topmost = false; autoRestart = true;
+        SaveSettings();
+        topmost = true; autoRestart = false;
+        LoadSettings();
+        Check(!topmost && autoRestart, "saving again replaces the file instead of appending to it");
+        fs::remove_all(probeRuntime.parent_path());
+        runtimeDir = savedRuntime;
+        topmost = true; autoRestart = false;
+    }
+
     CheckLogBars();
 
     CheckParentRepaint();
