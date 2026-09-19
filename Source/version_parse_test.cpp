@@ -643,12 +643,18 @@ struct FoldFrame {
     double atMs = 0;
     int width = 0, left = 0;
     int cross = 0, plate = 0, borders = 0, whale = 0;
+    int dark = 0;              // near-black pixels inside the window: the window's own unpainted DC
     int crossFrom = -1, crossTo = -1, plateFrom = -1, plateTo = -1;
     bool operator==(const FoldFrame& other) const {
         return width == other.width && left == other.left && cross == other.cross &&
-            plate == other.plate && borders == other.borders && whale == other.whale;
+            plate == other.plate && borders == other.borders && whale == other.whale && dark == other.dark;
     }
 };
+
+// A window-sized black area is thousands of pixels (the chip's part of the window alone is 262x48); a
+// handful can come out of the icon's antialiasing, so the limit sits well above that and well below a
+// real unpainted patch.
+static constexpr int foldProbeDarkLimit = 200;
 
 static void SaveScreenArea(const wchar_t* path, int screenLeft, int screenTop, int width, int height);
 
@@ -683,6 +689,7 @@ static int RunFoldProbe() {
         GetWindowRect(target, &now);
         frame.width = now.right - now.left;
         frame.left = now.left;
+        int winHeight = now.bottom - now.top;      // only what the window covers: the rest is the desktop
         BitBlt(memory, 0, 0, width, height, screen, box.left, box.top, SRCCOPY);
         BITMAPINFO info{};
         info.bmiHeader.biSize = sizeof(info.bmiHeader);
@@ -697,6 +704,10 @@ static int RunFoldProbe() {
             int run = 0;
             for (int x = 0; x < width; ++x) {
                 int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
+                // Near-black inside the window. The launcher's own colours are all light or coloured (text is
+                // #23324E, the border #B8B8B8), so black here is the window's own DC showing through unpainted
+                // — which is what the unfold area flashed before the repaint landed.
+                if (y < winHeight && r < 40 && g < 40 && b < 40) ++frame.dark;
                 // The whale is the only strongly blue thing in the window, so counting it says whether the
                 // chip is on screen at all — a frame with none of it is a frame with no window.
                 if (b > 150 && r < 120 && g < 140) ++frame.whale;
@@ -754,14 +765,22 @@ static int RunFoldProbe() {
             round == 0 ? "fold" : "unfold", (int)frames.size(), 600.0, clickedAt);
         FoldFrame last{};
         bool first = true;
+        int worstDark = 0;
         for (const FoldFrame& frame : frames) {
+            if (frame.dark > worstDark) worstDark = frame.dark;
             if (!first && frame == last) continue;
-            std::printf("   %+7.2f ms  window %d wide at x=%d   cross=%d@[%d..%d] plate=%d@[%d..%d] whale=%d borders=%d\n",
+            std::printf("   %+7.2f ms  window %d wide at x=%d   cross=%d@[%d..%d] plate=%d@[%d..%d] whale=%d borders=%d dark=%d\n",
                 frame.atMs - clickedAt, frame.width, frame.left, frame.cross, frame.crossFrom,
-                frame.crossTo, frame.plate, frame.plateFrom, frame.plateTo, frame.whale, frame.borders);
+                frame.crossTo, frame.plate, frame.plateFrom, frame.plateTo, frame.whale, frame.borders,
+                frame.dark);
             last = frame;
             first = false;
         }
+        Check(worstDark <= foldProbeDarkLimit,
+            round == 0 ? "folding never shows the window's own unpainted surface"
+                       : "unfolding never shows the window's own unpainted surface");
+        std::printf("      worst near-black count inside the window: %d (limit %d)\n",
+            worstDark, foldProbeDarkLimit);
         // Keep a picture of what the probe just looked at, so the shape can be checked with the eyes.
         RECT now{};
         GetWindowRect(target, &now);
@@ -782,7 +801,7 @@ static int RunFoldProbe() {
     DeleteDC(memory);
     ReleaseDC(nullptr, screen);
     std::printf("\nleft the launcher as it was found\n");
-    return 0;
+    return failures ? 1 : 0;
 }
 
 // Save the part of the screen the test just looked at, so the shape can be looked at with the eyes as

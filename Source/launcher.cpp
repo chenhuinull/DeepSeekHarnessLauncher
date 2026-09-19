@@ -2570,7 +2570,9 @@ static void Layout() {
         } else {
             // The other way round: dropping layered mode leaves the surface that is already there — the chip —
             // on screen for a frame, which is what the window looks like anyway, and the normal paint below
-            // then fills in the unfolded title bar.
+            // then fills in the unfolded title bar. What that surface holds in the part the alpha used to hide
+            // is the bitmap's own colour, which is why PaintLayeredChip fills it with the window's white
+            // instead of leaving it black: this frame is the one the reader saw as a black bar.
             SetLayered(false);
             if (systemCorners) {
                 SetWindowRgn(windowHandle, nullptr, FALSE);
@@ -2859,7 +2861,16 @@ static bool PaintLayeredChip() {
     HBITMAP dib = CreateDIBSection(screen, (BITMAPINFO*)&header, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
     if (!dib || !bits) { if (dib) DeleteObject(dib); return false; }
-    memset(bits, 0, (size_t)width * height * 4);          // nothing of the window is opaque to begin with
+    // Nothing of the window is opaque to begin with — but what is *not* painted is white, not black. The
+    // alpha channel is the chip's shape only where something composites it: dropping layered mode, or a
+    // remote desktop that reads the window's own surface, shows the bitmap's plain colour in the part the
+    // alpha was hiding. Left at zero that colour is black, and unfolding flashed a black bar across the
+    // window for a frame (measured: 12005 near-black pixels in the frame 7 ms after the double-click). White
+    // matches the window's own background, so that same frame reads as the window it is about to become.
+    // The alpha stays zero, so nothing changes where the alpha is honoured: with alpha 0 the compositor
+    // ignores the colour entirely.
+    for (unsigned* pixel = (unsigned*)bits, *end = pixel + (size_t)width * height; pixel != end; ++pixel)
+        *pixel = 0x00FFFFFFu;
     {
         // GDI+ writes proper alpha into those bits when the bitmap wraps them, which a compatible DC would
         // not: drawing through a DC leaves the alpha channel at zero and the chip would be invisible.
