@@ -2583,21 +2583,27 @@ static void Paint() {
         FillRect(memory, &left, brush);
         FillRect(memory, &right, brush);
         DeleteObject(brush);
-        // The corners are GDI+ arcs: at this radius a GDI arc is a visible staircase, while GDI+
-        // antialiases the curve. The path is the window region's own corner inset by half a pixel, so the
-        // whole stroke is inside the region — drawn on the boundary its outer half is clipped away and the
-        // corner comes out faint and broken, and drawn any wider the arc stops following the window's
-        // shape. The ends land on the straight sides, which cover the half pixel they overlap.
+        // The corners are filled quarter-rings, not stroked arcs. A stroked curve straddles the pixel grid
+        // and covers each pixel by about three quarters, so the corners came out visibly lighter than the
+        // straight sides even at the same colour and a wider pen did not help. A filled ring is solid in
+        // the middle and antialiased only along its two edges: smooth curve, same weight as the sides.
         g.Flush();
-        const float inset = 0.5f;
-        const float radius = (float)cornerRadius - inset;
-        const float span = 2 * radius;
+        SolidBrush cornerBrush{Color(windowBorderArgb)};
         float fx = (float)chipLeft, fy = 0.f, fw = (float)chipWidth, fh = (float)h;
-        Pen cornerPen(Color(windowBorderArgb), 1.0f);
-        g.DrawArc(&cornerPen, RectF(fx + inset, fy + inset, span, span), 180.f, 90.f);
-        g.DrawArc(&cornerPen, RectF(fx + fw - inset - span, fy + inset, span, span), 270.f, 90.f);
-        g.DrawArc(&cornerPen, RectF(fx + fw - inset - span, fy + fh - inset - span, span, span), 0.f, 90.f);
-        g.DrawArc(&cornerPen, RectF(fx + inset, fy + fh - inset - span, span, span), 90.f, 90.f);
+        const float outer = (float)cornerRadius - 0.1f;   // stays just inside the window region
+        const float inner = outer - 1.f;                  // one pixel of border
+        const float centre = (float)cornerRadius;
+        auto ring = [&](float cx, float cy, float from) {
+            GraphicsPath path;
+            path.AddArc(RectF(cx - outer, cy - outer, 2 * outer, 2 * outer), from, 90.f);
+            path.AddArc(RectF(cx - inner, cy - inner, 2 * inner, 2 * inner), from + 90.f, -90.f);
+            path.CloseFigure();
+            g.FillPath(&cornerBrush, &path);
+        };
+        ring(fx + centre, fy + centre, 180.f);
+        ring(fx + fw - centre, fy + centre, 270.f);
+        ring(fx + fw - centre, fy + fh - centre, 0.f);
+        ring(fx + centre, fy + fh - centre, 90.f);
         g.Flush();
     }
     DrawButton(g,LampRect(),L"",Button::Status);
