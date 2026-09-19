@@ -948,19 +948,30 @@ static void RunScreenChecks() {
                   seen.dashFirstX < Scaled(firstButtonX),
                 "on screen: close and minimize sit inside the plate, in that order");
 
-            // Folded, the same two controls change places: lamp on the left, whale on the right.
-            SetWindowPos(bar, nullptr, 0, 0, Scaled(W_MINI), Scaled(H_COLLAPSED), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            // Fold it the way the launcher folds it, and read the direction off the screen: the chip
+            // pulls its left edge in and keeps the right edge, so the lamp and the whale under the
+            // reader's pointer stay put. Keeping the left edge is what would throw the whale across.
+            RECT before{};
+            int whaleBefore = 0;
+            GetWindowRect(bar, &before);
+            whaleBefore = before.left + seen.firstX;
             mini = true;
-            InvalidateRect(bar, nullptr, TRUE);
-            UpdateWindow(bar);
+            Layout();
             Settle(200);
             TitleBarPixels folded = ScanTitleBar(bar, Scaled(W_MINI), Scaled(H_COLLAPSED));
-            std::printf("      folded chip %d px wide: lamp x=%d..%d, icon x=%d..%d\n",
-                Scaled(W_MINI), folded.lampFirstX, folded.lampLastX, folded.firstX, folded.lastX);
+            RECT after{};
+            GetWindowRect(bar, &after);
+            std::printf("      folded chip %d px wide at x=%d: lamp x=%d..%d, icon x=%d..%d (screen %d, was %d)\n",
+                Scaled(W_MINI), (int)after.left, folded.lampFirstX, folded.lampLastX,
+                folded.firstX, folded.lastX, (int)after.left + folded.firstX, whaleBefore);
             Check(folded.lamp > 0 && folded.icon > 0 && folded.lampLastX < folded.firstX,
                 "on screen: folded, the lamp is on the left and the whale on the right");
             Check(folded.lampFirstX >= 0 && folded.lastX < Scaled(W_MINI),
                 "on screen: both of the folded chip's controls are inside the narrow chip");
+            Check(after.right == before.right && after.left > before.left,
+                "on screen: folding takes the left edge in and leaves the right edge where it was");
+            Check(after.left + folded.firstX == whaleBefore,
+                "on screen: the whale does not jump when the chip folds, which is the point of folding left to right");
             mini = false;
 
             if (appIcon) DestroyIcon(appIcon);
@@ -1405,6 +1416,48 @@ static int RunChecks(int argc, wchar_t** argv) {
               (mini = true, LampRect().x == miniLampRect.x && IconRect().x == miniIconRect.x),
             "the lamp and the whale rects follow the chip state, which is what the hit test uses");
         mini = false;
+    }
+
+    // The corner radius is one number for the buttons, the menu highlight, the log box and the window
+    // frame, and the window region has to curve by the same amount or the shape and the stroke that
+    // traces it disagree.
+    Check(cornerRadius == 3.0f, "one corner radius, tightened to 3px, is shared by everything round");
+    Check(windowCornerEllipsePx == (int)(2 * cornerRadius),
+        "the window region's corner ellipse is twice the painted radius, so shape and frame agree");
+
+    // Folding direction: the chip pulls its left edge in and leaves the right edge alone, so the lamp
+    // and the whale stay where they are. Driving the real Layout() is what shows it.
+    {
+        HWND probe = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 400, 300, Scaled(W), Scaled(H_COLLAPSED),
+            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!probe) {
+            Check(false, "a window to lay out could be created");
+        } else {
+            HWND previousWindow = windowHandle;
+            bool previousMini = mini, previousExpanded = expanded;
+            windowHandle = probe;
+            mini = false; expanded = false;
+            Layout();
+            RECT open{};
+            GetWindowRect(probe, &open);
+            mini = true;
+            Layout();
+            RECT folded{};
+            GetWindowRect(probe, &folded);
+            Check(folded.right == open.right && folded.left > open.left,
+                "folding moves the left edge right and leaves the right edge in place");
+            Check(folded.left - open.left == Scaled(W) - Scaled(W_MINI),
+                "the chip shrinks by exactly the width it gave up");
+            mini = false;
+            Layout();
+            RECT again{};
+            GetWindowRect(probe, &again);
+            Check(again.left == open.left && again.right == open.right,
+                "unfolding grows back to the left, landing exactly where it started");
+            windowHandle = previousWindow;
+            mini = previousMini; expanded = previousExpanded;
+            DestroyWindow(probe);
+        }
     }
 
     CheckLogBars();

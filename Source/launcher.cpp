@@ -114,7 +114,14 @@ static constexpr UINT_PTR autoRestartTimerId = 1;
 // Shared with the "stopped, update available" lamp: a running service with auto restart armed is
 // purple too, and the two can never be on at once because that one needs a stopped service.
 static constexpr ARGB lampPurpleArgb = 0xFFA855F7;
-static constexpr float controlCornerRadius = 4.0f;   // buttons and the log box share this
+// One corner radius for everything the launcher draws round: the buttons, the window-button plate,
+// the menu highlight, the log box and the window frame itself. The frame used to be rounder (6) than
+// the controls (4), which read as two different shapes, and the reader asked for it unified and a
+// little tighter.
+static constexpr float cornerRadius = 3.0f;
+// CreateRoundRectRgn takes the size of the corner ellipse rather than a radius, which is twice as
+// large, and that is what keeps the window's shape and the frame painted around it in step.
+static constexpr int windowCornerEllipsePx = (int)(2 * cornerRadius);
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
 // Versions this build is known to work with. Downloads stay reproducible and a
 // newer dsh is only installed when the user asks for it.
@@ -2080,7 +2087,7 @@ static void DrawLogMenuItem(const DRAWITEMSTRUCT* draw) {
     // Filled, not stroked, so the box is not shrunk by a pen width: both insets stay equal.
     Rounded(path, (float)highlight.left, (float)highlight.top,
         (float)(highlight.right - highlight.left), (float)(highlight.bottom - highlight.top),
-        controlCornerRadius);
+        cornerRadius);
     SolidBrush fill(selected ? Color(219,234,254) : Color(255,255,255));
     if (selected) g.FillPath(&fill, &path);
 
@@ -2376,9 +2383,17 @@ static void Layout() {
     if (!windowHandle) return;
     int width = Scaled(mini ? W_MINI : W);
     int height = Scaled(mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED));
-    SetWindowPos(windowHandle, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    // Folding and unfolding pull the left edge in and out and leave the right edge alone, so the chip
+    // collapses left-to-right and the lamp and the whale do not move: they sit the same distance from
+    // the right edge in both shapes, which is right where the reader's pointer already is. Keeping the
+    // left edge instead threw the whale from the right end of the title bar to the left.
+    RECT current{};
+    GetWindowRect(windowHandle, &current);
+    SetWindowPos(windowHandle, nullptr, current.right - width, current.top, width, height,
+        SWP_NOZORDER | SWP_NOACTIVATE);
     if (!systemCorners)
-        SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height, Scaled(12), Scaled(12)), TRUE);
+        SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height,
+            Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), TRUE);
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(logSide), Scaled(logTop), Scaled(logEditWidth), Scaled(logEditHeight), SWP_NOZORDER | SWP_NOACTIVATE);
         bool show = expanded && !mini;
@@ -2493,7 +2508,7 @@ static void DrawButton(Graphics& g, const UiRect& r, const std::wstring& label, 
     if (!primary) ToneColors(tone, bg, border, fg, hoverButton == button);
     if (disabled) { bg = Color(248,250,252); fg = Color(160,170,185); border = Color(221,228,238); }
     else if (primary && hoverButton == button) { bg = Color(29,78,216); }
-    GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, controlCornerRadius);
+    GraphicsPath path; Rounded(path,r.x+.5f, r.y+.5f, r.w-1.f, r.h-1.f, cornerRadius);
     SolidBrush fill(bg); Pen edge(border, 1); g.FillPath(&fill, &path); g.DrawPath(&edge, &path);
 }
 
@@ -2517,7 +2532,7 @@ static void Paint() {
     int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
     SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, width, h);
     if (!systemCorners) {
-        GraphicsPath frame; Rounded(frame,1.f,1.f,width-2.f,h-2.f,6);
+        GraphicsPath frame; Rounded(frame,1.f,1.f,width-2.f,h-2.f,cornerRadius);
         Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
     }
     DrawButton(g,LampRect(),L"",Button::Status);
@@ -2529,7 +2544,7 @@ static void Paint() {
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning, UpdateTone());
     DrawButton(g,topRect,L"置顶",Button::Topmost,false,false,topmost ? Tone::Accent : Tone::Plain);
     GraphicsPath titlePath;
-    Rounded(titlePath,titleClusterX + .5f,10.5f,(float)(2 * titleButtonWidth - 1),27,controlCornerRadius);
+    Rounded(titlePath,titleClusterX + .5f,10.5f,(float)(2 * titleButtonWidth - 1),27,cornerRadius);
     SolidBrush pale(Color(248,250,252));
     Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
@@ -2546,7 +2561,7 @@ static void Paint() {
     g.DrawLine(&cross,closeRect.x + 16,19,closeRect.x + 8,29);
     }   // end of the buttons-only block
     if (expanded && !mini) {
-        GraphicsPath logBox; Rounded(logBox,logBoxSide,logBoxTop,(float)(W - 2 * logBoxSide),logBoxHeight,controlCornerRadius); Pen logBorder(Color(221,228,238),1);
+        GraphicsPath logBox; Rounded(logBox,logBoxSide,logBoxTop,(float)(W - 2 * logBoxSide),logBoxHeight,cornerRadius); Pen logBorder(Color(221,228,238),1);
         g.DrawPath(&logBorder,&logBox);
     }
     g.Flush();
