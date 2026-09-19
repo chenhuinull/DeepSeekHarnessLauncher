@@ -2059,15 +2059,26 @@ static int RunChecks(int argc, wchar_t** argv) {
             Check(folded.left == open.left && folded.top == open.top && folded.right == open.right,
                 "folding leaves the window rectangle alone, so there is no geometry change to compose");
             // Folded, the chip is a layered window: its shape is the alpha channel of a bitmap handed to the
-            // compositor, so the rounded corners are antialiased like the ones DWM draws. A region would cut
-            // those antialiased edges off again with a hard staircase, so there must not be one.
+            // compositor, so the rounded corners are antialiased like the ones DWM draws. It also carries a
+            // region on its own box, because that alpha is only the shape where something composites it — a
+            // remote desktop reading the window's own surface showed the whole window, frame and all, around
+            // the chip. The region is the clip; the alpha inside it still draws the corners, and the clip is a
+            // plain rectangle, so it takes none of them with it (the on-screen checks read the arcs).
             Check((GetWindowLongPtrW(probe, GWL_EXSTYLE) & WS_EX_LAYERED) != 0,
                 "folding makes the chip a layered window, whose alpha is its shape");
             {
                 HRGN region = CreateRectRgn(0, 0, 0, 0);
-                Check(GetWindowRgn(probe, region) == ERROR,
-                    "the layered chip carries no window region, which would clip its antialiased corners");
+                RECT clip{};
+                bool clipped = GetWindowRgn(probe, region) != ERROR;
+                if (clipped) GetRgnBox(region, &clip);
                 DeleteObject(region);
+                std::printf("      folded clip box: %d,%d..%d,%d (chip box is %d,0..%d,%d)\n",
+                    (int)clip.left, (int)clip.top, (int)clip.right, (int)clip.bottom,
+                    Scaled(miniOffsetX), Scaled(W), Scaled(H_COLLAPSED));
+                Check(clipped && clip.left == Scaled(miniOffsetX) && clip.right >= Scaled(W) &&
+                      clip.bottom >= Scaled(H_COLLAPSED),
+                    "the folded window is clipped to the chip's box, so a compositor that ignores the alpha "
+                    "cannot show the rest of the window");
             }
             Check(openBox.left == 0 && openBox.right >= Scaled(W) && openBox.bottom >= Scaled(H_COLLAPSED),
                 "unfolded, the region covers the whole window including its last column and row");
