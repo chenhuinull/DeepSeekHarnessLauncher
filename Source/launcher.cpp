@@ -164,6 +164,10 @@ static int autoRestartStreak = 0;         // automatic restarts in a row that ha
 static ULONGLONG autoRestartReadyAt = 0;  // when the running service last became ready
 static bool mini = false;
 static bool stopping = false, updateAvailable = false, serverExternal = false;
+// Whether the system will round the window's corners and draw its border for us. Its corners are
+// antialiased, which a window region's are not, so the unfolded window hands its shape over to DWM and
+// only the folded chip — which has to be cut out of the window — uses a region and a frame of our own.
+static bool systemCorners = false;
 static std::atomic_bool serverReady{false};
 static State status = State::Missing;
 static Button hoverButton = Button::None;
@@ -2408,14 +2412,20 @@ static void Layout() {
     GetWindowRect(windowHandle, &current);
     SetWindowPos(windowHandle, nullptr, current.left, current.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     {
-        int left = mini ? Scaled(miniOffsetX) : 0;
-        int bottom = mini ? Scaled(H_COLLAPSED) : height;
-        // One more than the box: CreateRoundRectRgn covers the rectangle minus its right and bottom
-        // edges, so a region asked for 344x48 covers 343x47 and the window's last column and row are not
-        // part of it at all — the frame drawn on them was clipped away, which is why the border was
-        // missing on exactly two sides.
-        SetWindowRgn(windowHandle, CreateRoundRectRgn(left, 0, width + 1, bottom + 1,
-            Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+        // The unfolded window keeps its rectangle and lets DWM round the corners and draw the border, which
+        // is antialiased and smooth. The region is only for the folded chip, where half of the window has to
+        // be cut away; on systems without DWM corners the window rounds itself with a region and paints its
+        // own frame, the way it does when folded.
+        if (mini) {
+            int left = Scaled(miniOffsetX);
+            SetWindowRgn(windowHandle, CreateRoundRectRgn(left, 0, width + 1, Scaled(H_COLLAPSED) + 1,
+                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+        } else if (systemCorners) {
+            SetWindowRgn(windowHandle, nullptr, FALSE);
+        } else {
+            SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width + 1, height + 1,
+                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+        }
     }
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(logSide), Scaled(logTop), Scaled(logEditWidth), Scaled(logEditHeight), SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2564,12 +2574,14 @@ static void Paint() {
     int chipWidth = mini ? W_MINI : W;
     int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
     SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, W, H_EXPANDED);
-    // The frame's sides are drawn with GDI rather than GDI+: a 1px GDI+ stroke straddles its path and
-    // leaves half a pixel in one column and half in the next, so the sides came out blurred and uneven.
-    // GDI fills land exactly on the pixels they are given. The corners stay GDI+, because at this radius
-    // a GDI arc is a visible staircase and GDI+ antialiases the curve.
+    // The frame is drawn only when the window is not being rounded and framed by DWM: the folded chip
+    // (which is a region, so DWM's border would be around the whole window rectangle) and any system
+    // without DWM corners. Its sides are drawn with GDI rather than GDI+: a 1px GDI+ stroke straddles its
+    // path and leaves half a pixel in one column and half in the next, so the sides came out blurred and
+    // uneven. GDI fills land exactly on the pixels they are given. The corners stay GDI+, because at this
+    // radius a GDI arc is a visible staircase and GDI+ antialiases the curve.
     g.Flush();
-    {
+    if (mini || !systemCorners) {
         const int r = Scaled((int)cornerRadius);
         const int x0 = Scaled(chipLeft), y0 = 0, w = Scaled(chipWidth), hgt = Scaled(h);
         HBRUSH brush = CreateSolidBrush(windowBorderColor);
@@ -2741,13 +2753,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_CREATE: {
         windowHandle = hwnd;
-        // No DWM corner preference for the launcher itself: its shape is a window region now, because
-        // that is what folding uses, and the region and the frame painted inside it have to agree.
-        // (The right-click menus still ask DWM for their corners.) DWM's own border is turned off as
-        // well: it drew a dark hairline just outside the frame on two sides, which read as a second,
-        // uneven border around the one this launcher draws itself.
-        COLORREF noBorder = (COLORREF)DWMWA_COLOR_NONE;
-        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &noBorder, sizeof(noBorder));
+        // DWM rounds the window's corners and draws its border, in the launcher's own border colour. That
+        // is what the unfolded window shows: its corners are antialiased, where a window region's are a
+        // hard staircase, and a hand-drawn frame inside a region never lines up with the region's edge.
+        DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
+        systemCorners = SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners)));
+        if (systemCorners) {
+            COLORREF borderColor = windowBorderColor;
+            DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
+        }
         appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
         SendMessageW(hwnd,WM_SETICON,ICON_SMALL,(LPARAM)appIcon);
         logEdit = nullptr;
