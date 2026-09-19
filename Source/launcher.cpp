@@ -2407,6 +2407,18 @@ static void ToggleAutoRestart() {
 }
 
 static int Scaled(int n) { return (int)(n * scaleFactor + .5f); }
+// DWM's frame and a window region do not combine: once a corner preference is set, DWM rounds and frames
+// the window's whole rectangle and the region is ignored — folding then left the entire window visible
+// with only the chip painted. So the folded chip asks DWM to draw nothing and draws its own frame, and the
+// unfolded window hands its frame back to DWM.
+static void ApplySystemFrame() {
+    if (!systemCorners) return;                   // the system never rounded anything here
+    DWM_WINDOW_CORNER_PREFERENCE corners = mini ? DWMWCP_DONOTROUND : DWMWCP_ROUNDSMALL;
+    DwmSetWindowAttribute(windowHandle, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    COLORREF border = mini ? (COLORREF)DWMWA_COLOR_NONE : windowBorderColor;
+    DwmSetWindowAttribute(windowHandle, DWMWA_BORDER_COLOR, &border, sizeof(border));
+}
+
 static void Layout() {
     if (!windowHandle) return;
     // The width never changes: the folded chip is a region of the same window rectangle, anchored to
@@ -2416,6 +2428,7 @@ static void Layout() {
     RECT current{};
     GetWindowRect(windowHandle, &current);
     SetWindowPos(windowHandle, nullptr, current.left, current.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    ApplySystemFrame();
     {
         // The unfolded window keeps its rectangle and lets DWM round the corners and draw the border, which
         // is antialiased and smooth. The region is only for the folded chip, where half of the window has to
