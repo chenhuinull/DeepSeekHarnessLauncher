@@ -574,6 +574,103 @@ static void ReportScreen(const char* what, HWND barWindow) {
         what, seen.systemTrack, seen.systemThumb, seen.ourLine, seen.white, seen.other);
 }
 
+// A window that paints itself with the launcher's own paint code, so the title bar can be looked at
+// on the real screen. The swap the reader asked for is a question about pixels: whether the drawing
+// followed the rects, or stayed behind where the whale used to be.
+static LRESULT CALLBACK ProbeTitleBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: Paint(); return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+
+static HWND MakeTitleBarWindow(int left, int top) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW info{sizeof(info)};
+        info.lpfnWndProc = ProbeTitleBarProc;
+        info.hInstance = GetModuleHandleW(nullptr);
+        info.lpszClassName = L"ProbeTitleBar";
+        info.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        RegisterClassExW(&info);
+        registered = true;
+    }
+    return CreateWindowExW(WS_EX_TOOLWINDOW, L"ProbeTitleBar", L"", WS_POPUP,
+        left, top, Scaled(W), Scaled(H_COLLAPSED), nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
+// A solid icon, so the pixels it leaves are known: whatever comes back in that colour is the whale's
+// slot, wherever the layout has put it.
+static HICON MakeSolidIcon(int size, COLORREF color) {
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = size;
+    header.bV5Height = size;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00FF0000;
+    header.bV5GreenMask = 0x0000FF00;
+    header.bV5BlueMask = 0x000000FF;
+    header.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP colour = CreateDIBSection(screen, (BITMAPINFO*)&header, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!colour || !bits) { if (colour) DeleteObject(colour); return nullptr; }
+    DWORD* pixels = (DWORD*)bits;
+    // 0xAARRGGBB, which is what a 32-bit BGRA DIB wants: packing it the other way round swaps red
+    // and blue and the "blue" icon comes back red.
+    DWORD value = 0xFF000000u | ((DWORD)GetRValue(color) << 16) | ((DWORD)GetGValue(color) << 8) | GetBValue(color);
+    for (int i = 0; i < size * size; ++i) pixels[i] = value;
+    std::vector<BYTE> zero((size_t)(((size + 15) / 16) * 2) * size, 0);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, zero.data());
+    ICONINFO info{};
+    info.fIcon = TRUE;
+    info.hbmColor = colour;
+    info.hbmMask = mask;
+    HICON icon = CreateIconIndirect(&info);
+    DeleteObject(colour);
+    if (mask) DeleteObject(mask);
+    return icon;
+}
+
+struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1; };
+
+static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
+    TitleBarPixels seen;
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    RECT box{};
+    GetWindowRect(window, &box);
+    BitBlt(memory, 0, 0, width, height, screen, box.left, box.top, SRCCOPY);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            COLORREF pixel = GetPixel(memory, x, y);
+            // Close to the pen's own colour: ClearType puts coloured fringes on the button labels, and
+            // a loose "reddish" test would read those as the close button.
+            if (GetBValue(pixel) > 200 && GetRValue(pixel) < 40 && GetGValue(pixel) < 40) {
+                ++seen.icon;
+                if (seen.firstX < 0 || x < seen.firstX) seen.firstX = x;
+                if (x > seen.lastX) seen.lastX = x;
+            } else if (std::abs((int)GetRValue(pixel) - 185) <= 30 &&
+                       std::abs((int)GetGValue(pixel) - 28) <= 40 &&
+                       std::abs((int)GetBValue(pixel) - 28) <= 40) {
+                ++seen.red;                       // the close button's cross is the only red up here
+                if (x > seen.redLastX) seen.redLastX = x;
+            }
+        }
+    }
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    return seen;
+}
+
 static void RunScreenChecks() {
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
@@ -745,6 +842,62 @@ static void RunScreenChecks() {
         "on screen: the horizontal bar shows its own line and no system chrome");
 
     SetCursorPos(savedCursor.x, savedCursor.y);
+
+    // The title bar itself, painted by the launcher's paint code and read back off the screen. The
+    // window buttons and the whale traded places, and the whale is drawn from a rect: this is what
+    // shows that the drawing followed the rect instead of staying where the whale used to be.
+    {
+        HWND bar = MakeTitleBarWindow(left, top);
+        if (!bar) {
+            Check(false, "a title bar window for the on-screen check could be created");
+        } else {
+            HWND previousWindow = windowHandle;
+            HICON previousIcon = appIcon;
+            bool previousMini = mini, previousExpanded = expanded, previousTopmost = topmost;
+            State previousStatus = status;
+            // Paint() reads the launcher's globals, so point them at this window and at a state whose
+            // colours are known: unfolded, nothing busy, lamp stopped, and no accent-blue button.
+            windowHandle = bar;
+            mini = false; expanded = false; serverRunning = false; busy = false;
+            topmost = false; status = State::Stopped; autoRestart = false;
+            SetWindowPos(bar, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            ShowWindow(bar, SW_SHOW);
+
+            // Control first: with no icon set there must be no icon-coloured pixel at all, or
+            // "found the whale" would not mean anything.
+            appIcon = nullptr;
+            InvalidateRect(bar, nullptr, TRUE);
+            UpdateWindow(bar);
+            Settle(150);
+            TitleBarPixels none = ScanTitleBar(bar, Scaled(W), Scaled(H_COLLAPSED));
+            Check(none.icon == 0 && none.red > 0,
+                "on screen: with no icon set only the window buttons are drawn, so the icon colour is meaningful");
+
+            appIcon = MakeSolidIcon(22, RGB(0, 0, 255));
+            InvalidateRect(bar, nullptr, TRUE);
+            UpdateWindow(bar);
+            Settle(200);
+            TitleBarPixels seen = ScanTitleBar(bar, Scaled(W), Scaled(H_COLLAPSED));
+            UiRect draw = IconDrawRect();
+            std::printf("      title bar %d px wide: icon at x=%d..%d (%d px, rect %d..%d), close cross ends at x=%d\n",
+                Scaled(W), seen.firstX, seen.lastX, seen.icon, Scaled(draw.x),
+                Scaled(draw.x + draw.w), seen.redLastX);
+            Check(seen.icon > 200, "on screen: the whale really is drawn in the title bar");
+            Check(seen.firstX >= Scaled(draw.x) - 2 && seen.lastX <= Scaled(draw.x + draw.w) + 2,
+                "on screen: the whale is drawn where its rect is, not at the spot it used to occupy");
+            Check(seen.firstX > Scaled(W) / 2, "on screen: the whale sits in the right half of the title bar");
+            Check(seen.red > 0 && seen.redLastX < Scaled(W) / 2,
+                "on screen: the minimize and close buttons sit in the left half, so the two did trade places");
+
+            if (appIcon) DestroyIcon(appIcon);
+            appIcon = previousIcon;
+            windowHandle = previousWindow;
+            mini = previousMini; expanded = previousExpanded; topmost = previousTopmost; status = previousStatus;
+            autoRestart = false;
+            DestroyWindow(bar);
+        }
+    }
+
     DestroyWindow(logEdit);
     logEdit = nullptr;
     logVerticalBar = logHorizontalBar = nullptr;
@@ -1143,6 +1296,30 @@ static int RunChecks(int argc, wchar_t** argv) {
         fs::remove_all(probeRuntime.parent_path());
         runtimeDir = savedRuntime;
         topmost = true; autoRestart = false;
+    }
+
+    // The title bar, after the reader asked for the whale and the two window buttons to trade
+    // places: the window buttons lead, the launcher's own buttons follow, and the whale closes the
+    // row. The icon is drawn from a rect, so that rect is checked to be inside its slot too.
+    {
+        Check(minRect.x < firstButtonX && closeRect.x + closeRect.w <= firstButtonX,
+            "the minimize and close buttons now lead the title bar");
+        Check(iconRect.x >= lastButtonRight && iconRect.x + iconRect.w <= W,
+            "the whale closes the title bar now, instead of opening it");
+        Check(minRect.x + 2 * titleButtonWidth <= iconRect.x,
+            "the window buttons and the whale stay at opposite ends, with the buttons between them");
+        UiRect draw = IconDrawRect();
+        Check(draw.x >= iconRect.x && draw.x + draw.w <= iconRect.x + iconRect.w &&
+              draw.y >= iconRect.y && draw.y + draw.h <= iconRect.y + iconRect.h,
+            "the icon is drawn inside its slot, so the drawing follows the rect that moved");
+        Check(miniIconRect.x == 10 && miniLampRect.x == 42 && W_MINI == 84,
+            "the folded chip keeps the whale and the lamp where they always were");
+        Check(miniLampRect.x + miniLampRect.w <= W_MINI && miniIconRect.x + miniIconRect.w <= W_MINI,
+            "both of the folded chip's controls still fit inside it");
+        Check(!mini && LampRect().x == statusRect.x && IconRect().x == iconRect.x &&
+              (mini = true, LampRect().x == miniLampRect.x && IconRect().x == miniIconRect.x),
+            "the lamp and the whale rects follow the chip state, which is what the hit test uses");
+        mini = false;
     }
 
     CheckLogBars();

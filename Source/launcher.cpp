@@ -59,16 +59,23 @@ static const wchar_t* const logFontFallback = L"Consolas";
 static constexpr int buttonWidth = 46, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
 // The status control is a lamp only, so it stays as narrow as a square indicator.
 static constexpr int indicatorWidth = 28;
-static constexpr int firstButtonX = 42;
+// The title bar reads [minimize][close] then the buttons, and the whale closes the row: the reader
+// asked for the whale and the two window buttons to trade places, so the buttons that used to sit
+// next to the whale at the far left now lead the chip, and the whale takes their old slot.
+static constexpr int leftMargin = 10, rightMargin = 14;
+static constexpr int titleButtonWidth = 25, titleClusterGap = 8;
+static constexpr int minX = leftMargin;
+static constexpr int closeX = minX + titleButtonWidth;
+static constexpr int firstButtonX = closeX + titleButtonWidth + titleClusterGap;
 static constexpr int statusX = firstButtonX;
 static constexpr int startX = statusX + indicatorWidth + buttonGap;
 static constexpr int logX = startX + buttonWidth + buttonGap;
 static constexpr int updateX = logX + buttonWidth + buttonGap;
 static constexpr int topmostX = updateX + buttonWidth + buttonGap;
 static constexpr int lastButtonRight = topmostX + buttonWidth;
-static constexpr int titleClusterGap = 8, titleButtonWidth = 25, rightMargin = 14;
-static constexpr int titleClusterX = lastButtonRight + titleClusterGap;
-static constexpr int W = titleClusterX + 2 * titleButtonWidth + rightMargin;
+static constexpr int iconTop = 8, iconWidth = 26, iconHeight = 32;
+static constexpr int iconX = lastButtonRight + titleClusterGap;
+static constexpr int W = iconX + iconWidth + rightMargin;
 // Inside the painted border the text box takes everything except the bar zone, so the text gets the
 // space a system scroll bar strip would have taken.
 static constexpr int logBoxRightPx = W - 17, logBoxBottomPx = 48 + logHeight + 8;
@@ -78,8 +85,10 @@ static constexpr int logEditHeight = logBoxBottomPx - logBarZone - logTop;
 // without it the window's painting is not clipped away from the log box and its bars, and any erase
 // path that is not BeginPaint (which clips by itself) can touch them.
 static constexpr DWORD mainWindowStyle = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-// Folded down to the whale icon and the status lamp; the rest of the chip drags.
-static constexpr int W_MINI = statusX + indicatorWidth + rightMargin;
+// Folded down to the whale icon and the status lamp; the rest of the chip drags. The folded chip has
+// no window buttons to swap with, so it keeps the layout and the width it always had.
+static constexpr int miniIconX = leftMargin, miniGap = 6, miniLampX = miniIconX + iconWidth + miniGap;
+static constexpr int W_MINI = miniLampX + indicatorWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
 static constexpr int maxLogLines = 50'000;
 static constexpr int trimChunk = 500;
@@ -153,10 +162,23 @@ static const UiRect statusRect{statusX, buttonTop, indicatorWidth, buttonHeight}
 static const UiRect startRect{startX, buttonTop, buttonWidth, buttonHeight};
 static const UiRect updateRect{updateX, buttonTop, buttonWidth, buttonHeight};
 static const UiRect topRect{topmostX, buttonTop, buttonWidth, buttonHeight};
-static const UiRect minRect{titleClusterX, buttonTop, titleButtonWidth, buttonHeight};
-static const UiRect closeRect{titleClusterX + titleButtonWidth, buttonTop, titleButtonWidth, buttonHeight};
-// The whale icon doubles as the fold/unfold handle, so it is excluded from dragging.
-static const UiRect iconRect{10, 8, 26, 32};
+static const UiRect minRect{minX, buttonTop, titleButtonWidth, buttonHeight};
+static const UiRect closeRect{closeX, buttonTop, titleButtonWidth, buttonHeight};
+// The whale icon is the fold/unfold handle, the window's drag handle, and now the last thing in the
+// unfolded title bar.
+static const UiRect iconRect{iconX, iconTop, iconWidth, iconHeight};
+static const UiRect miniIconRect{miniIconX, iconTop, iconWidth, iconHeight};
+static const UiRect miniLampRect{miniLampX, buttonTop, indicatorWidth, buttonHeight};
+// The lamp and the whale sit in different places folded and unfolded, so the paint and hit-test
+// paths ask for the rect instead of naming one.
+static UiRect LampRect() { return mini ? miniLampRect : statusRect; }
+static UiRect IconRect() { return mini ? miniIconRect : iconRect; }
+// Where the icon is actually drawn inside that rect. Derived rather than a pair of numbers, so the
+// drawing cannot be left behind at the old spot when the rect moves.
+static UiRect IconDrawRect() {
+    UiRect box = IconRect();
+    return UiRect{box.x + (box.w - 22) / 2, box.y + (box.h - 22) / 2, 22, 22};
+}
 
 static int Scaled(int n);   // defined with the layout code further down
 static void Rounded(GraphicsPath& p, float x, float y, float w, float h, float radius);
@@ -2361,6 +2383,12 @@ static void Layout() {
             ShowWindow(logHorizontalBar, show ? SW_SHOW : SW_HIDE);
         }
     }
+    // The lamp moves when the chip folds, so the tooltip's hot spot has to move with it.
+    if (tooltip) {
+        UiRect lamp = LampRect();
+        tipInfo.rect = {Scaled(lamp.x), Scaled(buttonTop), Scaled(lamp.x + buttonWidth), Scaled(buttonTop + buttonHeight)};
+        SendMessageW(tooltip, TTM_NEWTOOLRECTW, 0, (LPARAM)&tipInfo);
+    }
     InvalidateRect(windowHandle, nullptr, TRUE);
 }
 
@@ -2375,7 +2403,7 @@ static void ToggleMini() {
 static Button Hit(int x, int y) {
     if (mini) return Button::None;   // folded: the whole chip drags, the icon toggles
     if (logRect.contains(x,y)) return Button::Log;
-    if (statusRect.contains(x,y)) return Button::Status;
+    if (LampRect().contains(x,y)) return Button::Status;
     if (startRect.contains(x,y)) return Button::Start;
     if (updateRect.contains(x,y)) return Button::Update;
     if (topRect.contains(x,y)) return Button::Topmost;
@@ -2391,7 +2419,7 @@ static void InvalidateButton(Button button) {
     UiRect ui{};
     switch (button) {
     case Button::Log: ui = logRect; break;
-    case Button::Status: ui = statusRect; break;
+    case Button::Status: ui = LampRect(); break;
     case Button::Start: ui = startRect; break;
     case Button::Update: ui = updateRect; break;
     case Button::Topmost: ui = topRect; break;
@@ -2486,15 +2514,17 @@ static void Paint() {
         GraphicsPath frame; Rounded(frame,1.f,1.f,width-2.f,h-2.f,6);
         Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
     }
-    DrawButton(g,statusRect,L"",Button::Status);
+    DrawButton(g,LampRect(),L"",Button::Status);
     SolidBrush dot(ColorForStatus());
-    g.FillEllipse(&dot,statusRect.x + (indicatorWidth - 10) / 2,buttonTop + (buttonHeight - 10) / 2,10,10);
+    g.FillEllipse(&dot,LampRect().x + (indicatorWidth - 10) / 2,buttonTop + (buttonHeight - 10) / 2,10,10);
     if (!mini) {
     DrawButton(g,startRect,serverRunning ? L"停止" : L"启动",Button::Start,true,busy);
     DrawButton(g,logRect,L"日志",Button::Log);
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning, UpdateTone());
     DrawButton(g,topRect,L"置顶",Button::Topmost,false,false,topmost ? Tone::Accent : Tone::Plain);
-    GraphicsPath titlePath; Rounded(titlePath,titleClusterX + .5f,10.5f,49,27,controlCornerRadius); SolidBrush pale(Color(248,250,252));
+    GraphicsPath titlePath;
+    Rounded(titlePath,minRect.x + .5f,10.5f,(float)(2 * titleButtonWidth - 1),27,controlCornerRadius);
+    SolidBrush pale(Color(248,250,252));
     Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
         GraphicsState saved = g.Save(); g.SetClip(&titlePath);
@@ -2514,7 +2544,10 @@ static void Paint() {
         g.DrawPath(&logBorder,&logBox);
     }
     g.Flush();
-    if (appIcon) DrawIconEx(memory, Scaled(12), Scaled(13), appIcon, Scaled(22), Scaled(22), 0, nullptr, DI_NORMAL);
+    if (appIcon) {
+        UiRect icon = IconDrawRect();
+        DrawIconEx(memory, Scaled(icon.x), Scaled(icon.y), appIcon, Scaled(icon.w), Scaled(icon.h), 0, nullptr, DI_NORMAL);
+    }
     if (!mini) {
     HFONT font = CreateFontW(-Scaled(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
@@ -2589,8 +2622,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         // caption is what lets Windows tell "press and move" (drag) from "two quick
         // clicks" (double click) — doing the drag ourselves would swallow the second
         // click — and it delivers WM_NCLBUTTONDBLCLK for the fold.
-        if (iconRect.contains(x, y)) return HTCAPTION;
-        if (mini) return statusRect.contains(x, y) ? HTCLIENT : HTCAPTION;
+        if (IconRect().contains(x, y)) return HTCAPTION;
+        if (mini) return LampRect().contains(x, y) ? HTCLIENT : HTCAPTION;
         if (y < 50 && Hit(x, y) == Button::None) return HTCAPTION;
         return HTCLIENT;
     }
@@ -2598,7 +2631,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &point);
         int x = (int)(point.x / scaleFactor), y = (int)(point.y / scaleFactor);
-        if (iconRect.contains(x, y)) ToggleMini();
+        if (IconRect().contains(x, y)) ToggleMini();
         return 0;
     }
     case WM_NCRBUTTONUP:
@@ -2628,7 +2661,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
         tipInfo.cbSize=sizeof(tipInfo); tipInfo.uFlags=TTF_SUBCLASS; tipInfo.hwnd=hwnd;
         tipInfo.uId=1;
-        tipInfo.rect={Scaled(statusRect.x),Scaled(buttonTop),Scaled(statusRect.x + buttonWidth),Scaled(buttonTop + buttonHeight)};
+        { UiRect lamp = LampRect();
+          tipInfo.rect={Scaled(lamp.x),Scaled(buttonTop),Scaled(lamp.x + buttonWidth),Scaled(buttonTop + buttonHeight)}; }
         tipInfo.lpszText=statusTip.data(); SendMessageW(tooltip,TTM_ADDTOOLW,0,(LPARAM)&tipInfo);
         Layout();
         bool attached = AttachRunningServer() || AdoptRunningService();
@@ -2682,7 +2716,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_LBUTTONDBLCLK: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
-        if(iconRect.contains(x,y)) ToggleMini();
+        if(IconRect().contains(x,y)) ToggleMini();
         return 0;
     }
     case WM_LOG: {
