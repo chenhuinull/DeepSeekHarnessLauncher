@@ -138,9 +138,12 @@ static constexpr COLORREF windowBorderColor = RGB(0xB8, 0xB8, 0xB8);
 // the controls (4), which read as two different shapes, and the reader asked for it unified and a
 // little tighter.
 static constexpr float cornerRadius = 3.0f;
-// CreateRoundRectRgn takes the size of the corner ellipse rather than a radius, which is twice as
-// large, and that is what keeps the window's shape and the frame painted around it in step.
-static constexpr int windowCornerEllipsePx = (int)(2 * cornerRadius);
+// CreateRoundRectRgn takes the size of the corner ellipse rather than a radius, which is twice as large.
+// The region's corner is deliberately one pixel wider than the radius the frame is drawn with: the frame's
+// arcs are circles centred a radius in from the corner, so they can never reach the region's own edge, and
+// with both at the same radius the corner ended up with a third of a pixel of white between the border and
+// the window's silhouette — which reads as a border that does not reach the corner.
+static constexpr int windowCornerEllipsePx = (int)(2 * (cornerRadius + 1));
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
 // Versions this build is known to work with. Downloads stay reproducible and a
 // newer dsh is only installed when the user asks for it.
@@ -2621,7 +2624,11 @@ static void Paint() {
         SolidBrush cornerBrush{Color(windowBorderArgb)};
         float fx = (float)chipLeft, fy = 0.f, fw = (float)chipWidth, fh = (float)h;
         const float outer = (float)cornerRadius - 0.1f;   // stays just inside the window region
-        const float inner = outer - 1.f;                  // one pixel of border
+        // A little wider than the sides on purpose: an antialiased curve running diagonally covers a pixel
+        // by about three quarters at 1px, so the corners came out lighter than the straight sides even in
+        // the same colour. 1.4px brings the core of the curve up to full colour, and the eye reads a
+        // diagonal line as thinner than a straight one of the same width anyway.
+        const float inner = outer - 1.4f;
         const float centre = (float)cornerRadius;
         auto ring = [&](float cx, float cy, float from) {
             GraphicsPath path;

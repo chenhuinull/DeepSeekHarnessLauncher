@@ -1806,8 +1806,11 @@ static int RunChecks(int argc, wchar_t** argv) {
     // frame, and the window region has to curve by the same amount or the shape and the stroke that
     // traces it disagree.
     Check(cornerRadius == 3.0f, "one corner radius, tightened to 3px, is shared by everything round");
-    Check(windowCornerEllipsePx == (int)(2 * cornerRadius),
-        "the window region's corner ellipse is twice the painted radius, so shape and frame agree");
+    // The region's corner is one pixel wider than the radius the frame is drawn with: the frame's arcs are
+    // circles centred a radius in from the corner and can never reach the region's own edge, so at equal
+    // radii the corners kept a sliver of white between the border and the window's silhouette.
+    Check(windowCornerEllipsePx == (int)(2 * (cornerRadius + 1)),
+        "the region's corner is one pixel wider than the frame's, so the frame reaches the silhouette");
     // The lit part of the lamp: bigger than the 10px dot it used to be, and still inside its button with
     // a margin all round, or the lamp would look like a filled square of colour.
     Check(lampDotDiameter > 10 && lampDotDiameter <= indicatorWidth - 6,
