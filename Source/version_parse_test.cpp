@@ -840,6 +840,7 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         midLeft = 0, midLeftFull = 0, midRight = 0, midRightFull = 0,
                         midTop = 0, midTopFull = 0, midBottom = 0, midBottomFull = 0,
                         cornerTL = 0, cornerTR = 0, cornerBL = 0, cornerBR = 0,
+                        cornerTLDark = 255, cornerTRDark = 255, cornerBLDark = 255, cornerBRDark = 255,
                         edgeTop = 0, edgeBottom = 0, edgeLeft = 0, edgeRight = 0,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
@@ -945,10 +946,11 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                 // The corner zones, where the border has to turn: drawn on the window region's own edge the
                 // arcs were clipped away entirely and the corners had no border at all.
                 const int zone = 5;
-                if (x < zone && y < zone) ++seen.cornerTL;
-                else if (x >= width - zone && y < zone) ++seen.cornerTR;
-                else if (x < zone && y >= height - zone) ++seen.cornerBL;
-                else if (x >= width - zone && y >= height - zone) ++seen.cornerBR;
+                int value = (int)GetRValue(pixel);
+                if (x < zone && y < zone) { ++seen.cornerTL; if (value < seen.cornerTLDark) seen.cornerTLDark = value; }
+                else if (x >= width - zone && y < zone) { ++seen.cornerTR; if (value < seen.cornerTRDark) seen.cornerTRDark = value; }
+                else if (x < zone && y >= height - zone) { ++seen.cornerBL; if (value < seen.cornerBLDark) seen.cornerBLDark = value; }
+                else if (x >= width - zone && y >= height - zone) { ++seen.cornerBR; if (value < seen.cornerBRDark) seen.cornerBRDark = value; }
             }
         }
     }
@@ -1254,12 +1256,32 @@ static void RunScreenChecks() {
             Check(seen.midLeft == 1 && seen.midLeftFull == 1 && seen.midRight == 1 && seen.midRightFull == 1 &&
                   seen.midTop == 1 && seen.midTopFull == 1 && seen.midBottom == 1 && seen.midBottomFull == 1,
                 "on screen: each side is exactly one full pixel of #B8B8B8, so all four sides match");
+            // The lamp dot has to sit in the middle of its button. Measured against where the layout says the
+            // button is, so what is judged is the drawn dot and not the arithmetic that placed it.
+            {
+                UiRect lamp = LampRect();
+                int buttonCentreX = Scaled(lamp.x + indicatorWidth / 2) * 2;
+                int buttonCentreY = Scaled(buttonTop + buttonHeight / 2) * 2;
+                int dotCentreX = seen.lampFirstX + seen.lampLastX + 1;
+                int dotCentreY = seen.lampFirstY + seen.lampLastY + 1;
+                std::printf("      lamp dot centre (%d,%d) vs its button's (%d,%d), both doubled\n",
+                    dotCentreX, dotCentreY, buttonCentreX, buttonCentreY);
+                Check(std::abs(dotCentreX - buttonCentreX) <= 1 && std::abs(dotCentreY - buttonCentreY) <= 1,
+                    "on screen: the lamp dot is centred in its button, both across and down");
+            }
             // The four corners: the border has to turn there. Drawn on the region's own edge the arcs were
             // clipped away and the corners had no border colour at all — which is what the reader saw.
             std::printf("      border pixels in the corner zones: TL %d, TR %d, BL %d, BR %d\n",
                 seen.cornerTL, seen.cornerTR, seen.cornerBL, seen.cornerBR);
             Check(seen.cornerTL >= 3 && seen.cornerTR >= 3 && seen.cornerBL >= 3 && seen.cornerBR >= 3,
                 "on screen: all four corners carry border pixels, so the frame goes right round");
+            // And each corner has at least one solidly covered pixel. Clipped by the window region the arcs
+            // came out as a faint, broken line: every pixel in the zone stayed near white.
+            std::printf("      darkest corner pixel: TL %d, TR %d, BL %d, BR %d (full border is 184)\n",
+                seen.cornerTLDark, seen.cornerTRDark, seen.cornerBLDark, seen.cornerBRDark);
+            Check(seen.cornerTLDark <= 205 && seen.cornerTRDark <= 205 &&
+                  seen.cornerBLDark <= 205 && seen.cornerBRDark <= 205,
+                "on screen: every corner has a solidly drawn pixel, not a faint clipped arc");
             // The bug this replaced: the pair's plate was derived from the minimize button, so once
             // close led the row the plate covered the left half of the start button and the divider
             // was drawn on the outside edge. Both are read off the screen here.
@@ -1764,6 +1786,10 @@ static int RunChecks(int argc, wchar_t** argv) {
     Check(lampDotDiameter > 10 && lampDotDiameter <= indicatorWidth - 6,
         "the lamp dot is bigger than it was and still leaves a margin inside the lamp button");
     Check(lampDotDiameter <= buttonHeight - 6, "the lamp dot fits the button's height too");
+    // Centred means the margins on the two sides are equal: with an odd diameter one side gets the extra
+    // pixel and the dot reads as sitting off to the left, which is what the reader saw.
+    Check((indicatorWidth - lampDotDiameter) % 2 == 0 && (buttonHeight - lampDotDiameter) % 2 == 0,
+        "the lamp dot leaves the same margin on both sides, so it is centred in its button");
     // The outermost border, in the colour the reader asked for (#B8B8B8), used by the painted frame and
     // by the frame the menus ask DWM for so the two keep matching.
     Check(windowBorderArgb == 0xFFB8B8B8u && windowBorderColor == RGB(0xB8, 0xB8, 0xB8),

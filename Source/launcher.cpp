@@ -60,8 +60,10 @@ static constexpr int buttonWidth = 46, buttonHeight = 28, buttonTop = 10, button
 // The status control is a lamp only, so it stays as narrow as a square indicator.
 static constexpr int indicatorWidth = 28;
 // The lit part of the lamp. It was 10px inside the 28px button, which read as a small dot in the
-// middle of a lot of white; the reader asked for a bigger one.
-static constexpr int lampDotDiameter = 15;
+// middle of a lot of white; the reader asked for a bigger one. Even and one less than a third of the
+// button is what makes it centred: 28 - 16 leaves 6 pixels of margin on each side, where an odd
+// diameter leaves 6 on one side and 7 on the other and the dot looks off to the left.
+static constexpr int lampDotDiameter = 16;
 // The title bar reads [close][minimize], then the launcher's own buttons, and ends with the lamp
 // sitting next to the whale. The reader asked for all three moves: the window buttons and the whale
 // traded places, then close and minimize swapped with each other, and the lamp came over to the whale.
@@ -2581,19 +2583,21 @@ static void Paint() {
         FillRect(memory, &left, brush);
         FillRect(memory, &right, brush);
         DeleteObject(brush);
-        // The corners are GDI+ arcs, with a radius one more than the window region's corner. That does two
-        // things: the arc lies inside the region instead of being half clipped by it (drawn on the region's
-        // own edge, the whole corner lost its border), and it starts and ends on the window's own edges, so
-        // the sides join it without a step.
+        // The corners are GDI+ arcs: at this radius a GDI arc is a visible staircase, while GDI+
+        // antialiases the curve. The path is the window region's own corner inset by half a pixel, so the
+        // whole stroke is inside the region — drawn on the boundary its outer half is clipped away and the
+        // corner comes out faint and broken, and drawn any wider the arc stops following the window's
+        // shape. The ends land on the straight sides, which cover the half pixel they overlap.
         g.Flush();
-        const float radius = (float)(cornerRadius + 1);
+        const float inset = 0.5f;
+        const float radius = (float)cornerRadius - inset;
         const float span = 2 * radius;
         float fx = (float)chipLeft, fy = 0.f, fw = (float)chipWidth, fh = (float)h;
         Pen cornerPen(Color(windowBorderArgb), 1.0f);
-        g.DrawArc(&cornerPen, RectF(fx, fy, span, span), 180.f, 90.f);
-        g.DrawArc(&cornerPen, RectF(fx + fw - span, fy, span, span), 270.f, 90.f);
-        g.DrawArc(&cornerPen, RectF(fx + fw - span, fy + fh - span, span, span), 0.f, 90.f);
-        g.DrawArc(&cornerPen, RectF(fx, fy + fh - span, span, span), 90.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx + inset, fy + inset, span, span), 180.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx + fw - inset - span, fy + inset, span, span), 270.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx + fw - inset - span, fy + fh - inset - span, span, span), 0.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx + inset, fy + fh - inset - span, span, span), 90.f, 90.f);
         g.Flush();
     }
     DrawButton(g,LampRect(),L"",Button::Status);
