@@ -10,7 +10,7 @@ Windows 桌面启动器，提供启动/停止、更新、窗口始终置顶及�
 
 鲸鱼图标旁的状态点：绿色表示已启动（包括接管的外部服务），黄色表示未启动，红色表示未安装 DeepSeek Harness，紫色表示未启动且有更新，橙色表示进程还在但 Web 服务已经没有应答。悬停状态点可查看说明。
 
-服务就绪后启动器每 5 秒仍会探测一次本地端口：连续 3 次没有应答（约 15 秒）就把状态灯变橙并在日志中写明原因（端口无监听，或端口有监听但不应答）；服务恢复应答后自动变回绿色。进程本身退出仍然会立即反映为黄/紫/红。
+服务就绪后启动器每 5 秒仍会探测一次本地端口，并且**每次探测都写进日志**，正常的和失败的一视同仁（只看失败的话，就没法判断服务已经安静了多久）：正常时是「健康检查：正常（HTTP 200，3 ms）。」，没有应答时写明是「端口已无监听」还是「端口仍在监听但没有应答」、以及这是连续第几次失败，探到别的程序占着端口则写成「应答不是 DeepSeek Harness 页面（HTTP 502）」。连续 3 次没有应答（约 15 秒）就把状态灯变橙；服务恢复应答后自动变回绿色，日志里同时出现一条「恢复正常（HTTP 200，2 ms，此前连续 N 次无应答）」。进程本身退出仍然会立即反映为黄/紫/红。
 
 DeepSeek 鲸鱼图标下载自 [DeepSeek 官网](https://www.deepseek.com/favicon.ico)。
 
@@ -33,6 +33,7 @@ cl /nologo /std:c++20 /utf-8 /O1 /MT /EHsc /DUNICODE /D_UNICODE /Fe:version_pars
 .\version_parse_test.exe            # 逻辑与界面行为检查
 .\version_parse_test.exe --screen   # 额外的屏幕级检查（会在右下角短暂显示一个小窗口）
 .\version_parse_test.exe --discover # 查看本机的 Node.js / npm 探测结果
+.\version_parse_test.exe --probe    # 立刻对正在运行的服务探测一次，打印日志里那一行
 ```
 
 首次点击“启动”会先寻找 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\tools\node` 中的 Node.js 和 npm；本地没有时使用系统已安装的版本，两处都没有时由启动器自己下载 Windows x64 的 Node.js ZIP 并校验 SHA-256，解压到本地工具目录。下载在启动器进程内用 WinHTTP 完成，解压调用系统自带的 `tar.exe`，**不依赖 Windows PowerShell**。随后通过 npm 把官方 `@deepseek-ai/dsh` 及其依赖安装到 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\runtime`，运行 `dsh web --no-open`。以后启动会复用这些本地文件，不需要重复下载。浏览器由启动器决定是否打开：读取 dsh 打印的地址后，先看浏览器里是否已经有 DeepSeek Harness 页面（按窗口标题精确匹配 `DeepSeek Harness`），已经打开就不重复开新标签页，没有才用默认浏览器打开带访问令牌的本地地址；地址随时可从运行日志复制。页面使用持久化的浏览器会话凭据，服务重启后已打开的页面依然可用。关闭启动器窗口不会停止 Web 服务；再次打开启动器会检测并接管仍在运行的服务，可通过“停止”按钮结束它。服务日志保存在 `%LOCALAPPDATA%\DeepSeekHarnessLauncher\server.log`。

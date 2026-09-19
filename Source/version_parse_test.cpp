@@ -18,7 +18,9 @@
 //   cl /nologo /std:c++20 /utf-8 /O1 /MT /EHsc /DUNICODE /D_UNICODE /Fe:version_parse_test.exe ^
 //      version_parse_test.cpp user32.lib gdi32.lib gdiplus.lib dwmapi.lib shell32.lib ole32.lib ^
 //      uuid.lib comctl32.lib iphlpapi.lib ws2_32.lib winhttp.lib bcrypt.lib advapi32.lib version.lib
-// Run with --discover to print the Node.js/npm copies found on this machine.
+// Run with --discover to print the Node.js/npm copies found on this machine, --screen for the
+// on-screen checks, and --probe to run one health probe against the service that is running now
+// and print the line the launcher writes to its log every five seconds.
 
 #include "launcher.cpp"
 
@@ -911,6 +913,20 @@ int wmain(int argc, wchar_t** argv) {
 
 static int RunChecks(int argc, wchar_t** argv) {
     if (argc > 1 && std::wstring(argv[1]) == L"--discover") { Discover(); return 0; }
+    if (argc > 1 && std::wstring(argv[1]) == L"--probe") {
+        // Live: the same probe the launcher runs every five seconds, pointed at whatever service
+        // is listening on the launcher's port right now, printed as the log line it produces.
+        HarnessProbe probe = ProbeHarness((USHORT)serverPort);
+        DWORD owner = PortOwnerPid(serverPort);
+        // Printed as UTF-8 rather than through wprintf: the CRT would convert to the console code
+        // page and turn the Chinese into question marks.
+        std::wstring line = HealthProbeMessage(probe, probe.recognised ? 0 : 1, owner != 0);
+        std::string utf8((size_t)WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, utf8.data(), (int)utf8.size(), nullptr, nullptr);
+        if (!utf8.empty() && utf8.back() == '\0') utf8.pop_back();
+        std::printf("port %d owner pid %u\n%s\n", (int)serverPort, owner, utf8.c_str());
+        return 0;
+    }
     if (argc > 1 && std::wstring(argv[1]) == L"--screen") {
         RunScreenChecks();
         std::printf(failures ? "\n%d check(s) failed\n" : "\non-screen checks passed\n", failures);
@@ -1019,6 +1035,36 @@ static int RunChecks(int argc, wchar_t** argv) {
     std::printf("      menu box margins: top %d, left %d, right %d, bottom %d (item %dx%d)\n",
         first.top - menuClient.top, first.left - menuClient.left, menuClient.right - first.right,
         menuClient.bottom - second.bottom, firstBand.right - firstBand.left, firstBand.bottom - firstBand.top);
+
+    // The five-second health check now writes a line every time it runs, so the shapes that line
+    // can take are pinned here. The detail matters: "the port is gone" and "the port is open and
+    // silent" send the reader to different places.
+    {
+        HarnessProbe alive{true, 200, true, 3};
+        std::wstring healthy = HealthProbeMessage(alive, 0, true);
+        Check(healthy.find(L"正常") != std::wstring::npos && healthy.find(L"HTTP 200") != std::wstring::npos &&
+              healthy.find(L"3 ms") != std::wstring::npos,
+            "a healthy check line reports the status code and how long the round trip took");
+        Check(HealthProbeMessage(alive, 2, true).find(L"恢复正常") != std::wstring::npos,
+            "a check that answers again after failures says so");
+
+        HarnessProbe silent{false, 0, false, 1200};
+        std::wstring portGone = HealthProbeMessage(silent, 1, false);
+        std::wstring portOpen = HealthProbeMessage(silent, 3, true);
+        Check(portGone.find(L"端口已无监听") != std::wstring::npos &&
+              portOpen.find(L"端口仍在监听但没有应答") != std::wstring::npos,
+            "a check with no answer says whether the port is still open, which is what tells a hang from a crash");
+        Check(portGone.find(L"连续 1/3 次") != std::wstring::npos &&
+              portOpen.find(L"连续 3/3 次") != std::wstring::npos,
+            "a failing check counts how many have failed in a row, against the threshold");
+        Check(portGone.find(L"1200 ms") != std::wstring::npos,
+            "a failing check reports the time the failure cost, so a timeout is recognisable");
+
+        HarnessProbe stranger{true, 502, false, 5};
+        std::wstring wrong = HealthProbeMessage(stranger, 1, true);
+        Check(wrong.find(L"应答不是") != std::wstring::npos && wrong.find(L"HTTP 502") != std::wstring::npos,
+            "a page that is not the harness is reported as such rather than as a healthy server");
+    }
 
     CheckLogBars();
 

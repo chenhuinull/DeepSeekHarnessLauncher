@@ -183,18 +183,35 @@ static DWORD PortOwnerPid(USHORT port) {
     return 0;
 }
 
+// What one probe found. Every five-second check is logged, so the result carries enough detail
+// to tell the failure modes apart: nothing listening, listening but not answering, or answering
+// with something that is not the harness page.
+struct HarnessProbe {
+    bool answered = false;    // a response arrived at all
+    DWORD status = 0;         // HTTP status code, 0 when there was none
+    bool recognised = false;  // the body is the DeepSeek Harness page
+    unsigned elapsedMs = 0;   // round trip, including the time a timeout costs
+};
+
 // The DSH web server answers an unauthenticated request with "dsh web authentication required".
-static bool ProbeHarness(USHORT port) {
+static HarnessProbe ProbeHarness(USHORT port) {
+    HarnessProbe probe;
+    ULONGLONG started = GetTickCount64();
     HINTERNET session = WinHttpOpen(L"DeepSeekHarnessLauncher/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) return false;
+    if (!session) return probe;
     WinHttpSetTimeouts(session, 600, 600, 1200, 1200);
-    bool result = false;
     if (HINTERNET connect = WinHttpConnect(session, L"127.0.0.1", port, 0)) {
         if (HINTERNET request = WinHttpOpenRequest(connect, L"GET", L"/", nullptr, WINHTTP_NO_REFERER,
             WINHTTP_DEFAULT_ACCEPT_TYPES, 0)) {
             if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
                 WinHttpReceiveResponse(request, nullptr)) {
+                probe.answered = true;
+                DWORD status = 0;
+                DWORD size = sizeof(status);
+                if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX))
+                    probe.status = status;
                 std::string body;
                 DWORD available = 0;
                 while (body.size() < 8192 && WinHttpQueryDataAvailable(request, &available) && available) {
@@ -206,7 +223,7 @@ static bool ProbeHarness(USHORT port) {
                 std::string lower;
                 lower.reserve(body.size());
                 for (char c : body) lower += (char)tolower((unsigned char)c);
-                result = lower.find("dsh web") != std::string::npos ||
+                probe.recognised = lower.find("dsh web") != std::string::npos ||
                     lower.find("deepseek harness") != std::string::npos;
             }
             WinHttpCloseHandle(request);
@@ -214,7 +231,25 @@ static bool ProbeHarness(USHORT port) {
         WinHttpCloseHandle(connect);
     }
     WinHttpCloseHandle(session);
-    return result;
+    probe.elapsedMs = (unsigned)(GetTickCount64() - started);
+    return probe;
+}
+
+// One line per health check. It is written every healthProbeIntervalMs, so it stays short, but
+// it has to say which failure it is: "the port is gone" and "the port is open and silent" send
+// the reader to different places.
+static std::wstring HealthProbeMessage(const HarnessProbe& probe, int failures, bool portListening) {
+    std::wstring took = std::to_wstring(probe.elapsedMs) + L" ms";
+    if (probe.recognised)
+        return failures
+            ? L"健康检查：恢复正常（HTTP " + std::to_wstring(probe.status) + L"，" + took + L"，此前连续 " +
+                std::to_wstring(failures) + L" 次无应答）。"
+            : L"健康检查：正常（HTTP " + std::to_wstring(probe.status) + L"，" + took + L"）。";
+    std::wstring reason = probe.answered
+        ? L"应答不是 DeepSeek Harness 页面（HTTP " + std::to_wstring(probe.status) + L"）"
+        : (portListening ? L"端口仍在监听但没有应答" : L"端口已无监听");
+    return L"健康检查：" + reason + L"（" + took + L"，连续 " + std::to_wstring(failures) + L"/" +
+        std::to_wstring(healthFailureThreshold) + L" 次）。";
 }
 
 static std::optional<PortService> InspectPort(USHORT port) {
@@ -228,7 +263,7 @@ static std::optional<PortService> InspectPort(USHORT port) {
         if (QueryFullProcessImageNameW(process, 0, path, &length)) service.image.assign(path, length);
         CloseHandle(process);
     }
-    service.harness = ProbeHarness(port);
+    service.harness = ProbeHarness(port).recognised;
     return service;
 }
 
@@ -1045,7 +1080,7 @@ static DWORD MonitorServer(HANDLE process, HANDLE job, ServerIdentity id, bool a
         // even when dsh changes what it prints.
         if (!serverReady && GetTickCount64() >= nextProbe) {
             nextProbe = GetTickCount64() + readyProbeIntervalMs;
-            if (ProbeHarness(serverPort)) {
+            if (ProbeHarness(serverPort).recognised) {
                 serverReady = true;
                 if (!closing) PostMessageW(windowHandle, WM_SERVER_READY, 0, 0);
             }
@@ -1053,16 +1088,26 @@ static DWORD MonitorServer(HANDLE process, HANDLE job, ServerIdentity id, bool a
             // The process handle says nothing about the web server inside it, so keep
             // asking the port and report when it stops answering.
             nextHealth = GetTickCount64() + healthProbeIntervalMs;
-            if (ProbeHarness(serverPort)) {
+            // Every check is written to the log, healthy or not: the reader asked to see the
+            // five-second heartbeat, and a line that only appears on failure cannot say how long
+            // the service has been quiet.
+            HarnessProbe probe = ProbeHarness(serverPort);
+            if (probe.recognised) {
+                int previous = healthFailures;
                 healthFailures = 0;
                 if (unhealthy) {
                     unhealthy = false;
                     if (!closing) PostMessageW(windowHandle, WM_SERVER_HEALTHY, 0, 0);
                 }
-            } else if (++healthFailures >= healthFailureThreshold && !unhealthy) {
-                unhealthy = true;
+                PostLog(HealthProbeMessage(probe, previous, true));
+            } else {
+                ++healthFailures;
                 bool listening = PortOwnerPid(serverPort) != 0;
-                if (!closing) PostMessageW(windowHandle, WM_SERVER_UNHEALTHY, listening ? 1 : 0, 0);
+                if (healthFailures >= healthFailureThreshold && !unhealthy) {
+                    unhealthy = true;
+                    if (!closing) PostMessageW(windowHandle, WM_SERVER_UNHEALTHY, listening ? 1 : 0, 0);
+                }
+                PostLog(HealthProbeMessage(probe, healthFailures, listening));
             }
         }
         if (WaitForSingleObject(process, 250) == WAIT_OBJECT_0) { exited = true; break; }
