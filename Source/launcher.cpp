@@ -2630,6 +2630,11 @@ static void Paint() {
         // diagonal line as thinner than a straight one of the same width anyway.
         const float inner = outer - 1.4f;
         const float centre = (float)cornerRadius;
+        // chipWidth and h are exclusive sizes: the last pixel column and row are one less, and the corner
+        // circles have to be measured from those. Using the exclusive edges put the right and bottom rings a
+        // pixel out, so their outer half fell outside the window and was clipped — the bottom right corner
+        // lost nearly all of its arc and the other two lost their ends.
+        const float chipRight = fx + fw - 1.f, chipBottom = fy + fh - 1.f;
         auto ring = [&](float cx, float cy, float from) {
             GraphicsPath path;
             path.AddArc(RectF(cx - outer, cy - outer, 2 * outer, 2 * outer), from, 90.f);
@@ -2638,9 +2643,9 @@ static void Paint() {
             g.FillPath(&cornerBrush, &path);
         };
         ring(fx + centre, fy + centre, 180.f);
-        ring(fx + fw - centre, fy + centre, 270.f);
-        ring(fx + fw - centre, fy + fh - centre, 0.f);
-        ring(fx + centre, fy + fh - centre, 90.f);
+        ring(chipRight - centre, fy + centre, 270.f);
+        ring(chipRight - centre, chipBottom - centre, 0.f);
+        ring(fx + centre, chipBottom - centre, 90.f);
         g.Flush();
     }
     DrawButton(g,LampRect(),L"",Button::Status);

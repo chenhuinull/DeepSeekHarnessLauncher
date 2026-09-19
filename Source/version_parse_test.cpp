@@ -832,6 +832,26 @@ static HICON MakeSolidIcon(int size, COLORREF color) {
     return icon;
 }
 
+// The darkest pixel found along one corner's arc: a hole there is nothing but white, and that is exactly
+// what a clipped arc looks like — the bottom right corner lost nearly all of its curve that way, and the
+// other two lost their ends.
+static int ArcWorst(HDC dc, int width, int height, int cx, int cy, int from) {
+    int worst = 0;
+    for (int a = from; a <= from + 90; a += 10) {
+        double rad = a * 3.14159265358979 / 180.0;
+        int best = 255;
+        for (double r = 1.4; r <= 3.1; r += 0.2) {
+            int x = (int)std::lround(cx + r * std::cos(rad));
+            int y = (int)std::lround(cy + r * std::sin(rad));
+            if (x < 0 || x >= width || y < 0 || y >= height) continue;
+            COLORREF pixel = GetPixel(dc, x, y);
+            if ((int)GetRValue(pixel) < best) best = (int)GetRValue(pixel);
+        }
+        if (best > worst) worst = best;
+    }
+    return worst;
+}
+
 struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1,
                         dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1,
                         lampFirstY = -1, lampLastY = -1,
@@ -842,6 +862,7 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         cornerTL = 0, cornerTR = 0, cornerBL = 0, cornerBR = 0,
                         cornerTLDark = 255, cornerTRDark = 255, cornerBLDark = 255, cornerBRDark = 255,
                         edgeTop = 0, edgeBottom = 0, edgeLeft = 0, edgeRight = 0,
+                        arcTL = 0, arcTR = 0, arcBL = 0, arcBR = 0,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 // The exact pixel profile across each edge of the window, printed so an asymmetric hairline shows up in
@@ -975,6 +996,15 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
             }
             run = 0;
         }
+    }
+    // The four corner arcs, swept angle by angle: the darkest pixel along each has to be a real border
+    // pixel, or the corner has a hole in it.
+    {
+        int inset = Scaled((int)cornerRadius);
+        seen.arcTL = ArcWorst(memory, width, height, inset, inset, 180);
+        seen.arcTR = ArcWorst(memory, width, height, width - 1 - inset, inset, 270);
+        seen.arcBR = ArcWorst(memory, width, height, width - 1 - inset, height - 1 - inset, 0);
+        seen.arcBL = ArcWorst(memory, width, height, inset, height - 1 - inset, 90);
     }
     SelectObject(memory, previous);
     DeleteObject(bitmap);
@@ -1328,6 +1358,10 @@ static void RunScreenChecks() {
                 folded.lampFirstX, folded.lampLastX, folded.firstX, folded.lastX, whaleAfter, whaleBefore);
             Check(folded.lamp > 0 && folded.icon > 0 && folded.lampLastX < folded.firstX,
                 "on screen: folded, the lamp is on the left and the whale on the right");
+            std::printf("      folded chip corner arcs (darkest pixel along each): TL %d, TR %d, BL %d, BR %d\n",
+                folded.arcTL, folded.arcTR, folded.arcBL, folded.arcBR);
+            Check(folded.arcTL <= 220 && folded.arcTR <= 220 && folded.arcBL <= 220 && folded.arcBR <= 220,
+                "on screen: no corner of the folded chip has a hole in its arc");
             Check(folded.lampFirstX >= 0 && folded.lastX < chip.right - chip.left + 1,
                 "on screen: both of the folded chip's controls are inside the narrow chip");
             Check(after.left == before.left && after.right == before.right,
