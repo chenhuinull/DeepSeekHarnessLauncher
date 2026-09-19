@@ -1269,6 +1269,19 @@ static void RunScreenChecks() {
                 Check(std::abs(dotCentreX - buttonCentreX) <= 1 && std::abs(dotCentreY - buttonCentreY) <= 1,
                     "on screen: the lamp dot is centred in its button, both across and down");
             }
+            // The same two margins, read off the screen: the plate starts at the close button's left edge,
+            // the whale ends at its own right edge.
+            {
+                int leftGap = seen.plateFirstX;
+                int rightGap = Scaled(W) - 1 - seen.lastX;
+                std::printf("      margins on screen: %d px before the window buttons, %d px after the whale\n",
+                    leftGap, rightGap);
+                // The plate is a filled rounded shape, so its first fully covered pixel sits about a pixel
+                // and a half inside its own edge; two pixels of slack keep that out of the judgement while
+                // still catching the six pixels the right margin used to be out by.
+                Check(std::abs(leftGap - rightGap) <= 2,
+                    "on screen: the whale's right margin matches the window buttons' left margin");
+            }
             // The four corners: the border has to turn there. Drawn on the region's own edge the arcs were
             // clipped away and the corners had no border colour at all — which is what the reader saw.
             std::printf("      border pixels in the corner zones: TL %d, TR %d, BL %d, BR %d\n",
@@ -1764,10 +1777,24 @@ static int RunChecks(int argc, wchar_t** argv) {
         Check(draw.x >= iconRect.x && draw.x + draw.w <= iconRect.x + iconRect.w &&
               draw.y >= iconRect.y && draw.y + draw.h <= iconRect.y + iconRect.h,
             "the icon is drawn inside its slot, so the drawing follows the rect that moved");
+        // The gap the reader sees on the right is from the drawn icon to the window edge, and it has to
+        // match the gap from the window edge to the drawn close button on the left. The icon is drawn
+        // smaller than its slot and centred, so the slot margin alone is not that gap.
+        {
+            int leftGap = closeRect.x;
+            int rightGap = W - (draw.x + draw.w);
+            std::printf("      window margins: %d px before the close button, %d px after the whale\n",
+                leftGap, rightGap);
+            Check(leftGap == rightGap,
+                "the whale leaves the same margin on the right as the close button does on the left");
+        }
         Check(miniLampX == 10 && miniIconX == 42 && miniLampX < miniIconX,
             "folded, the lamp is on the left and the whale on the right");
-        Check(W_MINI == 82 && miniLampRect.x + miniLampRect.w <= W_MINI &&
-              miniIconRect.x + miniIconRect.w <= W_MINI,
+        Check(W_MINI - (miniIconX + iconPadding + iconDrawSize) == miniLampX,
+            "the folded chip leaves the same margin on both sides of its two controls");
+        Check(W_MINI == miniIconX + iconWidth + rightMargin && W_MINI < 82,
+            "the folded chip is narrower than it was, now that its right margin is the drawn one");
+        Check(miniLampRect.x + miniLampRect.w <= W_MINI && miniIconRect.x + miniIconRect.w <= W_MINI,
             "both of the folded chip's controls still fit inside it");
         Check(!mini && LampRect().x == statusRect.x && IconRect().x == iconRect.x &&
               (mini = true, LampRect().x == miniOffsetX + miniLampX && IconRect().x == miniOffsetX + miniIconX),

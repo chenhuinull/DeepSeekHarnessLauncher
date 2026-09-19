@@ -67,7 +67,7 @@ static constexpr int lampDotDiameter = 16;
 // The title bar reads [close][minimize], then the launcher's own buttons, and ends with the lamp
 // sitting next to the whale. The reader asked for all three moves: the window buttons and the whale
 // traded places, then close and minimize swapped with each other, and the lamp came over to the whale.
-static constexpr int leftMargin = 10, rightMargin = 14;
+static constexpr int leftMargin = 10, rightMargin = 8;
 static constexpr int titleButtonWidth = 25, titleClusterGap = 8;
 static constexpr int closeX = leftMargin;                 // close leads the row, minimize follows it
 static constexpr int minX = closeX + titleButtonWidth;
@@ -87,6 +87,10 @@ static constexpr int lastButtonRight = startX + buttonWidth;
 // The lamp comes after the buttons and right before the whale, which closes the row.
 static constexpr int statusX = lastButtonRight + titleClusterGap;
 static constexpr int iconTop = 8, iconWidth = 26, iconHeight = 32;
+// The icon is drawn smaller than its slot and centred in it, so the slot's right margin has to be short
+// by that padding for the gap the reader sees to match the one before the close button on the left.
+static constexpr int iconDrawSize = 22;
+static constexpr int iconPadding = (iconWidth - iconDrawSize) / 2;
 static constexpr int iconX = statusX + indicatorWidth + buttonGap;
 static constexpr int W = iconX + iconWidth + rightMargin;
 // Inside the painted border the text box takes everything except the bar zone, so the text gets the
@@ -213,7 +217,8 @@ static UiRect IconRect() {
 // drawing cannot be left behind at the old spot when the rect moves.
 static UiRect IconDrawRect() {
     UiRect box = IconRect();
-    return UiRect{box.x + (box.w - 22) / 2, box.y + (box.h - 22) / 2, 22, 22};
+    return UiRect{box.x + (box.w - iconDrawSize) / 2, box.y + (box.h - iconDrawSize) / 2,
+        iconDrawSize, iconDrawSize};
 }
 
 static int Scaled(int n);   // defined with the layout code further down
