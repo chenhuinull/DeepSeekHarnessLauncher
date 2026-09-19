@@ -836,6 +836,7 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1,
                         lampFirstY = -1, lampLastY = -1,
                         frame = 0, frameFirstX = -1, frameLastX = -1,
+                        frameLeft = 0, frameRight = 0, frameTop = 0, frameBottom = 0,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int width, int height) {
@@ -874,14 +875,21 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                 if (x > seen.lampLastX) seen.lampLastX = x;
                 if (seen.lampFirstY < 0 || y < seen.lampFirstY) seen.lampFirstY = y;
                 if (y > seen.lampLastY) seen.lampLastY = y;
-            } else if (std::abs((int)GetRValue(pixel) - 184) <= 6 &&
-                       std::abs((int)GetGValue(pixel) - 184) <= 6 &&
-                       std::abs((int)GetBValue(pixel) - 184) <= 6) {
-                // The outermost border, #B8B8B8. A 1.5px antialiased stroke keeps a few pixels of the
-                // colour it was given, and where they are says the frame is drawn around the window.
+            } else if (GetRValue(pixel) == GetGValue(pixel) && GetGValue(pixel) == GetBValue(pixel) &&
+                       GetRValue(pixel) >= 180 && GetRValue(pixel) <= 250) {
+                // The outermost border, #B8B8B8, or that colour blended with the white behind it. A
+                // 1.5px antialiased stroke has almost no pixel of the pure colour, so the test is for
+                // neutral grey: nothing else in the title bar has equal red, green and blue (the button
+                // borders are blue-grey, the labels are navy, the plate is off-white).
                 ++seen.frame;
                 if (seen.frameFirstX < 0 || x < seen.frameFirstX) seen.frameFirstX = x;
                 if (x > seen.frameLastX) seen.frameLastX = x;
+                // Counted per side, so a stroke that is half outside the window region on one side shows
+                // up as a side with fewer pixels rather than as a missing border nobody looks at.
+                if (x <= 4) ++seen.frameLeft;
+                else if (x >= width - 5) ++seen.frameRight;
+                if (y <= 4) ++seen.frameTop;
+                else if (y >= height - 5) ++seen.frameBottom;
             }
         }
     }
@@ -1150,8 +1158,23 @@ static void RunScreenChecks() {
             // The outermost border, read off the screen: #B8B8B8 along both vertical edges of the window.
             std::printf("      window border pixels: %d, x=%d..%d (window is %d wide)\n",
                 seen.frame, seen.frameFirstX, seen.frameLastX, Scaled(W));
+            std::printf("      border per side: left %d, right %d, top %d, bottom %d\n",
+                seen.frameLeft, seen.frameRight, seen.frameTop, seen.frameBottom);
             Check(seen.frame > 0 && seen.frameFirstX <= 2 && seen.frameLastX >= Scaled(W) - 3,
                 "on screen: the window's outermost border is drawn in #B8B8B8 along both edges");
+            Check(seen.frameLeft > 0 && seen.frameTop > 0 && seen.frameBottom > 0,
+                "on screen: the border is drawn on the left, the top and the bottom");
+            // Both vertical edges have to carry the same amount of stroke, and the stroke has to be the
+            // full 1.5px: with the path only 1px inside the window region the outward half of the stroke
+            // was clipped away and the count halved — which is exactly what "the border looks cut off"
+            // is. Measured: 1531 border pixels as drawn, 785 with the old 1px inset.
+            Check(seen.frameRight > 0 && seen.frameRight * 2 >= seen.frameLeft &&
+                  seen.frameLeft * 2 >= seen.frameRight,
+                "on screen: the right edge carries as much border as the left");
+            Check(seen.frameTop * 2 >= Scaled(W) * 3 && seen.frameBottom * 2 >= Scaled(W) * 3,
+                "on screen: the top and bottom borders are drawn whole, not half clipped away");
+            Check(seen.frameLeft * 2 >= Scaled(H_COLLAPSED) * 3 && seen.frameRight * 2 >= Scaled(H_COLLAPSED) * 3,
+                "on screen: the left and right borders are drawn whole too");
             // The bug this replaced: the pair's plate was derived from the minimize button, so once
             // close led the row the plate covered the left half of the start button and the divider
             // was drawn on the outside edge. Both are read off the screen here.

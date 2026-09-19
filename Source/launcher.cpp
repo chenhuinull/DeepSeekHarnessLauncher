@@ -2561,8 +2561,13 @@ static void Paint() {
     int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
     SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, W, H_EXPANDED);
     {
+        // The stroke is centred on its path, so the path has to sit half a pen width inside the region
+        // on every side. At 1px the right and bottom halves of the stroke fell outside the region and
+        // were clipped away, which read as a border that is missing on two sides.
+        constexpr float frameInset = 1.5f;
         GraphicsPath frame;
-        Rounded(frame,chipLeft + 1.f,1.f,chipWidth-2.f,h-2.f,cornerRadius);
+        Rounded(frame, chipLeft + frameInset, frameInset,
+            chipWidth - 2 * frameInset, h - 2 * frameInset, cornerRadius);
         Pen border(Color(windowBorderArgb),1.5f); g.DrawPath(&border,&frame);
     }
     DrawButton(g,LampRect(),L"",Button::Status);
