@@ -2861,16 +2861,27 @@ static bool PaintLayeredChip() {
     HBITMAP dib = CreateDIBSection(screen, (BITMAPINFO*)&header, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
     if (!dib || !bits) { if (dib) DeleteObject(dib); return false; }
-    // Nothing of the window is opaque to begin with — but what is *not* painted is white, not black. The
-    // alpha channel is the chip's shape only where something composites it: dropping layered mode, or a
+    // Nothing of the window is opaque to begin with, and what is *not* painted is white rather than black.
+    // The alpha channel is the chip's shape only where something composites it: dropping layered mode, or a
     // remote desktop that reads the window's own surface, shows the bitmap's plain colour in the part the
     // alpha was hiding. Left at zero that colour is black, and unfolding flashed a black bar across the
     // window for a frame (measured: 12005 near-black pixels in the frame 7 ms after the double-click). White
     // matches the window's own background, so that same frame reads as the window it is about to become.
-    // The alpha stays zero, so nothing changes where the alpha is honoured: with alpha 0 the compositor
-    // ignores the colour entirely.
     for (unsigned* pixel = (unsigned*)bits, *end = pixel + (size_t)width * height; pixel != end; ++pixel)
         *pixel = 0x00FFFFFFu;
+    // The chip's own box goes back to transparent black before the chip is drawn into it. Its border is
+    // antialiased, and GDI+ blends a half-covered pixel with whatever is already there: over the white above
+    // the fringe came out washed — measured, the corner arcs lost three or four pixels of antialiasing and
+    // read lighter (the four corners had 17/17/15/15 pixels below 245, they have 14/13/13/13 over white).
+    // White with alpha 0 is not a valid premultiplied colour in the first place, transparent black is, and it
+    // is what the chip's edge has always been blended over. Only the box is cleared: outside it the white
+    // stays, which is the part that used to flash black.
+    {
+        const int boxLeft = Scaled(miniOffsetX);
+        for (int y = 0; y < height; ++y)
+            for (int x = boxLeft; x < width; ++x)
+                ((unsigned*)bits)[(size_t)y * width + x] = 0u;
+    }
     {
         // GDI+ writes proper alpha into those bits when the bitmap wraps them, which a compatible DC would
         // not: drawing through a DC leaves the alpha channel at zero and the chip would be invisible.
