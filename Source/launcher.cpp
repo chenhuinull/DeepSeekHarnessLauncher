@@ -2435,6 +2435,7 @@ static void ShowTrayMenu() {
 // can refresh it without inventing a new detail line.
 static bool PaintLayeredChip();   // defined with the painting code below
 static void SetLayered(bool layered);
+static void ClipToChipBox();
 
 // Anything that changes how the panel looks goes through here. A layered window's WM_PAINT output is never
 // composited — its content is the bitmap the system was handed — so invalidating it would leave the stale
@@ -2563,10 +2564,10 @@ static void Layout() {
             InvalidateRect(windowHandle, nullptr, FALSE);
             UpdateWindow(windowHandle);
             SetLayered(true);
-            // The region is what the window is clipped to until the alpha surface has really landed.
-            // Once it has, the region goes: the alpha channel is the shape now, and the region's own
-            // corner (a wider radius than the chip's) would clip the antialiased corners away again.
-            if (PaintLayeredChip()) SetWindowRgn(windowHandle, nullptr, FALSE);
+            // The region is what the window is clipped to until the alpha surface has really landed, and
+            // then it becomes the chip's own box for the rest of the folded life: on a path that does not
+            // composite the alpha, the box is all that can be seen of the window.
+            if (PaintLayeredChip()) ClipToChipBox();
         } else {
             // The other way round: dropping layered mode leaves the surface that is already there — the chip —
             // on screen for a frame, which is what the window looks like anyway, and the normal paint below
@@ -2861,27 +2862,14 @@ static bool PaintLayeredChip() {
     HBITMAP dib = CreateDIBSection(screen, (BITMAPINFO*)&header, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
     if (!dib || !bits) { if (dib) DeleteObject(dib); return false; }
-    // Nothing of the window is opaque to begin with, and what is *not* painted is white rather than black.
-    // The alpha channel is the chip's shape only where something composites it: dropping layered mode, or a
-    // remote desktop that reads the window's own surface, shows the bitmap's plain colour in the part the
-    // alpha was hiding. Left at zero that colour is black, and unfolding flashed a black bar across the
-    // window for a frame (measured: 12005 near-black pixels in the frame 7 ms after the double-click). White
-    // matches the window's own background, so that same frame reads as the window it is about to become.
-    for (unsigned* pixel = (unsigned*)bits, *end = pixel + (size_t)width * height; pixel != end; ++pixel)
-        *pixel = 0x00FFFFFFu;
-    // The chip's own box goes back to transparent black before the chip is drawn into it. Its border is
-    // antialiased, and GDI+ blends a half-covered pixel with whatever is already there: over the white above
-    // the fringe came out washed — measured, the corner arcs lost three or four pixels of antialiasing and
-    // read lighter (the four corners had 17/17/15/15 pixels below 245, they have 14/13/13/13 over white).
-    // White with alpha 0 is not a valid premultiplied colour in the first place, transparent black is, and it
-    // is what the chip's edge has always been blended over. Only the box is cleared: outside it the white
-    // stays, which is the part that used to flash black.
-    {
-        const int boxLeft = Scaled(miniOffsetX);
-        for (int y = 0; y < height; ++y)
-            for (int x = boxLeft; x < width; ++x)
-                ((unsigned*)bits)[(size_t)y * width + x] = 0u;
-    }
+    // Transparent black everywhere to begin with: a valid premultiplied colour (colour zero with alpha zero)
+    // that draws nothing and can leak nothing. It used to be filled with white so that a path which ignores
+    // the alpha would show the window's own white instead of a black bar — but white with alpha zero is not a
+    // valid premultiplied value, and it did leak: with the wallpaper behind the chip, the whole window came
+    // out as a white bar. The shape is not the bitmap's job any more: the folded window carries a region on
+    // the chip's box (ClipToChipBox) that the window manager applies on every path, which is what keeps the
+    // rest of the window off the screen.
+    memset(bits, 0, (size_t)width * height * 4);
     {
         // GDI+ writes proper alpha into those bits when the bitmap wraps them, which a compatible DC would
         // not: drawing through a DC leaves the alpha channel at zero and the chip would be invisible.
@@ -2939,17 +2927,27 @@ static bool PaintLayeredChip() {
         // cut: the window keeps a region on the chip's box and paints through it the ordinary way. The
         // antialiased corners are lost, the chip is not.
         SetLayered(false);
-        if (HRGN chip = CreateRoundRectRgn(Scaled(miniOffsetX), 0, Scaled(W) + 1, Scaled(H_COLLAPSED) + 1,
-                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)))
-            SetWindowRgn(windowHandle, chip, FALSE);
+        ClipToChipBox();
         InvalidateRect(windowHandle, nullptr, FALSE);
         UpdateWindow(windowHandle);
     }
     return applied;
 }
 
-// The folded chip is a layered window: its shape comes from the bitmap's alpha channel, so it must not also
-// carry a window region, whose aliased edge would cut the antialiased corners off again.
+// The folded window is clipped to the chip's box for as long as it is folded. The alpha channel is the real
+// shape, but only where something composites it: a remote desktop or a screen grabber that reads the window's
+// own surface showed the whole 338px window instead — the reader saw a bar the width of the window around the
+// chip under ToDesk, black while the bitmap's empty part was left at zero and white after it was filled,
+// which is the same fault in a different colour. A region is applied by the window manager itself, so the
+// shape holds on every path. The clip is the chip's plain box, a hair larger than the rounded chip inside it,
+// so it takes none of the antialiased corner with it; a region rounded to the drawn radius does (measured:
+// the corner arcs read 240 instead of 215-226).
+static void ClipToChipBox() {
+    if (!windowHandle) return;
+    if (HRGN box = CreateRectRgn(Scaled(miniOffsetX), 0, Scaled(W), Scaled(H_COLLAPSED)))
+        SetWindowRgn(windowHandle, box, FALSE);
+}
+
 static void SetLayered(bool layered) {
     if (!windowHandle) return;
     LONG_PTR style = GetWindowLongPtrW(windowHandle, GWL_EXSTYLE);
