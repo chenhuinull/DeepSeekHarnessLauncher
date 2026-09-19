@@ -2562,10 +2562,10 @@ static void Paint() {
     int chipWidth = mini ? W_MINI : W;
     int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
     SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, W, H_EXPANDED);
-    // The frame is drawn with GDI instead of GDI+: RoundRect on whole pixels puts exactly one pixel of
-    // the colour on each side, with no antialiasing at all. A GDI+ stroke straddles its path, so at 1px
-    // it left half a pixel in one column and half in the next — and only one of the four sides came out
-    // a clean pixel, which is what made the border look incomplete on the others.
+    // The frame's sides are drawn with GDI rather than GDI+: a 1px GDI+ stroke straddles its path and
+    // leaves half a pixel in one column and half in the next, so the sides came out blurred and uneven.
+    // GDI fills land exactly on the pixels they are given. The corners stay GDI+, because at this radius
+    // a GDI arc is a visible staircase and GDI+ antialiases the curve.
     g.Flush();
     {
         const int r = Scaled((int)cornerRadius);
@@ -2580,23 +2580,21 @@ static void Paint() {
         FillRect(memory, &bottom, brush);
         FillRect(memory, &left, brush);
         FillRect(memory, &right, brush);
-        // The corners are arcs inset by one pixel. Drawing them on the boundary of the window region put
-        // every arc pixel outside the region, where the system clips it, so the four corners came out
-        // with no border at all — only a single stray pixel survived.
-        HPEN pen = CreatePen(PS_SOLID, 1, windowBorderColor);
-        HGDIOBJ oldPen = SelectObject(memory, pen);
-        HGDIOBJ oldBrush = SelectObject(memory, GetStockObject(NULL_BRUSH));
-        const int d = 2 * r;
-        Arc(memory, x0 + 1, y0 + 1, x0 + 1 + d, y0 + 1 + d, x0 + 1 + r, y0 + 1, x0 + 1, y0 + 1 + r);
-        Arc(memory, x0 + w - 1 - d, y0 + 1, x0 + w - 1, y0 + 1 + d, x0 + w - 1, y0 + 1 + r, x0 + w - 1 - r, y0 + 1);
-        Arc(memory, x0 + w - 1 - d, y0 + hgt - 1 - d, x0 + w - 1, y0 + hgt - 1, x0 + w - 1 - r, y0 + hgt - 1,
-            x0 + w - 1, y0 + hgt - 1 - r);
-        Arc(memory, x0 + 1, y0 + hgt - 1 - d, x0 + 1 + d, y0 + hgt - 1, x0 + 1, y0 + hgt - 1 - r,
-            x0 + 1 + r, y0 + hgt - 1);
-        SelectObject(memory, oldBrush);
-        SelectObject(memory, oldPen);
-        DeleteObject(pen);
         DeleteObject(brush);
+        // The corners are GDI+ arcs, with a radius one more than the window region's corner. That does two
+        // things: the arc lies inside the region instead of being half clipped by it (drawn on the region's
+        // own edge, the whole corner lost its border), and it starts and ends on the window's own edges, so
+        // the sides join it without a step.
+        g.Flush();
+        const float radius = (float)(cornerRadius + 1);
+        const float span = 2 * radius;
+        float fx = (float)chipLeft, fy = 0.f, fw = (float)chipWidth, fh = (float)h;
+        Pen cornerPen(Color(windowBorderArgb), 1.0f);
+        g.DrawArc(&cornerPen, RectF(fx, fy, span, span), 180.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx + fw - span, fy, span, span), 270.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx + fw - span, fy + fh - span, span, span), 0.f, 90.f);
+        g.DrawArc(&cornerPen, RectF(fx, fy + fh - span, span, span), 90.f, 90.f);
+        g.Flush();
     }
     DrawButton(g,LampRect(),L"",Button::Status);
     SolidBrush dot(ColorForStatus());

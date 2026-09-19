@@ -840,6 +840,7 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         midLeft = 0, midLeftFull = 0, midRight = 0, midRightFull = 0,
                         midTop = 0, midTopFull = 0, midBottom = 0, midBottomFull = 0,
                         cornerTL = 0, cornerTR = 0, cornerBL = 0, cornerBR = 0,
+                        edgeTop = 0, edgeBottom = 0, edgeLeft = 0, edgeRight = 0,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 // The exact pixel profile across each edge of the window, printed so an asymmetric hairline shows up in
@@ -923,6 +924,13 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                 else if (x >= width - 5) ++seen.frameRight;
                 if (y <= 4) ++seen.frameTop;
                 else if (y >= height - 5) ++seen.frameBottom;
+                // The same, but with the corners left out: the antialiased corner arcs reach into the edge
+                // bands, so only the straight part of each side is counted for thickness.
+                const int straight = 8;
+                if (y <= 1 && x >= straight && x < width - straight) ++seen.edgeTop;
+                if (y >= height - 2 && x >= straight && x < width - straight) ++seen.edgeBottom;
+                if (x <= 1 && y >= straight && y < height - straight) ++seen.edgeLeft;
+                if (x >= width - 2 && y >= straight && y < height - straight) ++seen.edgeRight;
                 // Along the middle line only: how many pixels of the border each side shows there, and how
                 // many of them are the full colour rather than a partly covered neighbour.
                 bool full = std::abs((int)GetRValue(pixel) - 184) <= 8;
@@ -1223,15 +1231,19 @@ static void RunScreenChecks() {
             Check(seen.frameRight > 0 && seen.frameRight * 2 >= seen.frameLeft &&
                   seen.frameLeft * 2 >= seen.frameRight,
                 "on screen: the right edge carries as much border as the left");
-            // Each side is exactly one pixel thick: one border pixel per column of the top and bottom, and
-            // per row of the left and right. Too many means the hairline was drawn twice or blurred over
-            // two columns (a stroked path does that), too few means half of it fell outside the window
-            // region — both of which are "the border does not look complete", just in different ways.
-            Check(seen.frameTop >= Scaled(W) - 4 && seen.frameTop <= Scaled(W) + 8 &&
-                  seen.frameBottom >= Scaled(W) - 4 && seen.frameBottom <= Scaled(W) + 8,
+            // Each side is exactly one pixel thick along its straight part: one border pixel per column of
+            // the top and bottom, per row of the left and right, corners left out. Too many means the
+            // hairline was drawn twice or blurred over two columns (a stroked path does that), too few
+            // means part of it fell outside the window region — both are "the border looks wrong", just in
+            // different ways. A blurred border would roughly double these counts.
+            std::printf("      straight parts: top %d, bottom %d, left %d, right %d (expect %d and %d)\n",
+                seen.edgeTop, seen.edgeBottom, seen.edgeLeft, seen.edgeRight,
+                Scaled(W) - 16, Scaled(H_COLLAPSED) - 16);
+            Check(seen.edgeTop >= Scaled(W) - 20 && seen.edgeTop <= Scaled(W) - 12 &&
+                  seen.edgeBottom >= Scaled(W) - 20 && seen.edgeBottom <= Scaled(W) - 12,
                 "on screen: the top and bottom borders are one pixel thick");
-            Check(seen.frameLeft >= Scaled(H_COLLAPSED) - 4 && seen.frameLeft <= Scaled(H_COLLAPSED) + 8 &&
-                  seen.frameRight >= Scaled(H_COLLAPSED) - 4 && seen.frameRight <= Scaled(H_COLLAPSED) + 8,
+            Check(seen.edgeLeft >= Scaled(H_COLLAPSED) - 20 && seen.edgeLeft <= Scaled(H_COLLAPSED) - 12 &&
+                  seen.edgeRight >= Scaled(H_COLLAPSED) - 20 && seen.edgeRight <= Scaled(H_COLLAPSED) - 12,
                 "on screen: the left and right borders are one pixel thick");
             // And each side is exactly one pixel of the full border colour at its own edge. A stroked
             // hairline spread itself over two columns and did it differently on the two sides, which is
