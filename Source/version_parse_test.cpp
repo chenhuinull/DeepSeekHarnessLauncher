@@ -577,10 +577,12 @@ static void ReportScreen(const char* what, HWND barWindow) {
 // A window that paints itself with the launcher's own paint code, so the title bar can be looked at
 // on the real screen. The swap the reader asked for is a question about pixels: whether the drawing
 // followed the rects, or stayed behind where the whale used to be.
+static int probeTitleBarPaints = 0;   // how many times the probe window has painted itself
+
 static LRESULT CALLBACK ProbeTitleBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_ERASEBKGND: return 1;
-    case WM_PAINT: Paint(); return 0;
+    case WM_PAINT: ++probeTitleBarPaints; Paint(); return 0;
     }
     return DefWindowProcW(hwnd, message, wp, lp);
 }
@@ -1403,6 +1405,13 @@ static int RunChecks(int argc, wchar_t** argv) {
             "the lamp and the whale both sit past the last button, and do not overlap");
         Check(minRect.x + 2 * titleButtonWidth <= iconRect.x,
             "the window buttons and the whale stay at opposite ends, with the buttons between them");
+        // The middle buttons run 置顶、更新、日志、启动/停止 from the left, which puts the button that
+        // starts and stops the service next to the lamp that reports it.
+        Check(topmostX == firstButtonX && updateX > topmostX && logX > updateX && startX > logX &&
+              startX + buttonWidth == lastButtonRight,
+            "the buttons read 置顶、更新、日志、启动/停止, in that order");
+        Check(lastButtonRight <= statusX && startX + buttonWidth <= statusX,
+            "启动/停止 ends up next to the lamp, with the other two before it");
         UiRect draw = IconDrawRect();
         Check(draw.x >= iconRect.x && draw.x + draw.w <= iconRect.x + iconRect.w &&
               draw.y >= iconRect.y && draw.y + draw.h <= iconRect.y + iconRect.h,
@@ -1428,8 +1437,7 @@ static int RunChecks(int argc, wchar_t** argv) {
     // Folding direction: the chip pulls its left edge in and leaves the right edge alone, so the lamp
     // and the whale stay where they are. Driving the real Layout() is what shows it.
     {
-        HWND probe = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 400, 300, Scaled(W), Scaled(H_COLLAPSED),
-            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND probe = MakeTitleBarWindow(-3000, -3000);
         if (!probe) {
             Check(false, "a window to lay out could be created");
         } else {
@@ -1437,23 +1445,39 @@ static int RunChecks(int argc, wchar_t** argv) {
             bool previousMini = mini, previousExpanded = expanded;
             windowHandle = probe;
             mini = false; expanded = false;
+            ShowWindow(probe, SW_SHOW);      // visible but off screen: a hidden window gets no WM_PAINT
+            Settle(120);
             Layout();
             RECT open{};
             GetWindowRect(probe, &open);
+            // Folding moves the window, so the paint has to happen before Layout returns: a queued paint
+            // leaves the compositor showing the unfolded surface at the folded position for a frame,
+            // which is the flicker at the moment of folding. The queued case is measured first, as the
+            // control that says the counter can tell the two apart.
+            probeTitleBarPaints = 0;
+            InvalidateRect(probe, nullptr, FALSE);
+            Check(probeTitleBarPaints == 0,
+                "a queued repaint does not paint inside the call, which is what made folding flicker");
+            probeTitleBarPaints = 0;
             mini = true;
             Layout();
+            Check(probeTitleBarPaints > 0,
+                "folding paints inside the same call, so no frame shows the old surface at the new place");
+            std::printf("      fold painted %d time(s) before returning\n", probeTitleBarPaints);
             RECT folded{};
             GetWindowRect(probe, &folded);
             Check(folded.right == open.right && folded.left > open.left,
                 "folding moves the left edge right and leaves the right edge in place");
             Check(folded.left - open.left == Scaled(W) - Scaled(W_MINI),
                 "the chip shrinks by exactly the width it gave up");
+            probeTitleBarPaints = 0;
             mini = false;
             Layout();
             RECT again{};
             GetWindowRect(probe, &again);
             Check(again.left == open.left && again.right == open.right,
                 "unfolding grows back to the left, landing exactly where it started");
+            Check(probeTitleBarPaints > 0, "unfolding paints inside the same call as well");
             windowHandle = previousWindow;
             mini = previousMini; expanded = previousExpanded;
             DestroyWindow(probe);

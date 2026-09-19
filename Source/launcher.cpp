@@ -72,11 +72,13 @@ static constexpr int minX = closeX + titleButtonWidth;
 static constexpr int titleClusterX = closeX;
 static constexpr int titleDividerX = titleClusterX + titleButtonWidth;
 static constexpr int firstButtonX = titleClusterX + 2 * titleButtonWidth + titleClusterGap;
-static constexpr int startX = firstButtonX;
-static constexpr int logX = startX + buttonWidth + buttonGap;
-static constexpr int updateX = logX + buttonWidth + buttonGap;
-static constexpr int topmostX = updateX + buttonWidth + buttonGap;
-static constexpr int lastButtonRight = topmostX + buttonWidth;
+// The buttons run 置顶、更新、日志、启动/停止 from the left, so the one that starts and stops the service
+// ends up right beside the lamp that reports what it did.
+static constexpr int topmostX = firstButtonX;
+static constexpr int updateX = topmostX + buttonWidth + buttonGap;
+static constexpr int logX = updateX + buttonWidth + buttonGap;
+static constexpr int startX = logX + buttonWidth + buttonGap;
+static constexpr int lastButtonRight = startX + buttonWidth;
 // The lamp comes after the buttons and right before the whale, which closes the row.
 static constexpr int statusX = lastButtonRight + titleClusterGap;
 static constexpr int iconTop = 8, iconWidth = 26, iconHeight = 32;
@@ -2392,8 +2394,11 @@ static void Layout() {
     SetWindowPos(windowHandle, nullptr, current.right - width, current.top, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE);
     if (!systemCorners)
+        // bRedraw FALSE: the system's own redraw here paints the window it is about to be told to
+        // repaint anyway, and it does it with the surface that is still in the compositor — which is
+        // the old content at the new position. One paint, below, is what avoids that.
         SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height,
-            Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), TRUE);
+            Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(logSide), Scaled(logTop), Scaled(logEditWidth), Scaled(logEditHeight), SWP_NOZORDER | SWP_NOACTIVATE);
         bool show = expanded && !mini;
@@ -2410,13 +2415,20 @@ static void Layout() {
         tipInfo.rect = {Scaled(lamp.x), Scaled(buttonTop), Scaled(lamp.x + indicatorWidth), Scaled(buttonTop + buttonHeight)};
         SendMessageW(tooltip, TTM_NEWTOOLRECTW, 0, (LPARAM)&tipInfo);
     }
-    InvalidateRect(windowHandle, nullptr, TRUE);
+    // Paint it now rather than letting the message loop get to it. Folding moves the whole window, and
+    // a queued paint leaves the compositor showing the surface it already has — the unfolded title bar
+    // at the folded position — for at least one frame. That is the flicker at the moment of folding.
+    // UpdateWindow sends WM_PAINT straight away, so the new content is in the same frame as the move.
+    InvalidateRect(windowHandle, nullptr, FALSE);
+    UpdateWindow(windowHandle);
 }
 
 static void ExpandLog(bool value) { if (expanded == value) return; expanded = value; Layout(); }
 static void ToggleMini() {
     mini = !mini;
-    if (mini) ExpandLog(false);
+    // One Layout, not two: setting expanded directly skips the extra full repaint that going through
+    // ExpandLog would add, and both changes land in the same move.
+    if (mini) expanded = false;
     Layout();
     AppendLog(mini ? L"已折叠为图标模式，双击鲸鱼图标可展开。"
                    : L"已展开全部按钮。");
