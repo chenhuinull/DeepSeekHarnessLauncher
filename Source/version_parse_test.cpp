@@ -568,6 +568,189 @@ static Seen LookAtScreen(HWND barWindow) {
     return seen;
 }
 
+// ---------------------------------------------------------------- fold flicker probe
+//
+// Folding moves the window, and a move plus a repaint is where a compositor can present a frame that
+// belongs to the state before. Numbers about our own painting cannot see that: what the reader sees is
+// the composed screen. This mode drives the real launcher window with a real double-click on the whale
+// and captures the screen as fast as it can, recording what every frame actually showed.
+struct FoldFrame {
+    double atMs = 0;
+    int width = 0, left = 0;
+    int cross = 0, plate = 0, borders = 0;
+    int crossFrom = -1, crossTo = -1, plateFrom = -1, plateTo = -1;
+    bool operator==(const FoldFrame& other) const {
+        return width == other.width && left == other.left && cross == other.cross &&
+            plate == other.plate && borders == other.borders;
+    }
+};
+
+static void SaveScreenArea(const wchar_t* path, int screenLeft, int screenTop, int width, int height);
+
+static int RunFoldProbe() {
+    HWND target = FindWindowW(L"DeepSeekHarnessLauncherNative", nullptr);
+    if (!target) {
+        std::printf("the launcher is not running, so there is nothing to fold\n");
+        return 0;
+    }
+    ShowWindow(target, SW_SHOW);
+    SetForegroundWindow(target);
+    RECT box{};
+    GetWindowRect(target, &box);
+    int width = box.right - box.left, height = box.bottom - box.top;
+    if (width <= 0 || height <= 0) { std::printf("the launcher window has no size\n"); return 0; }
+    // The whale, which is what the reader double-clicks to fold the chip.
+    int whaleX = box.left + Scaled(iconX + iconWidth / 2);
+    int whaleY = box.top + Scaled(iconTop + iconHeight / 2);
+
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    std::vector<unsigned char> pixels((size_t)width * height * 4);
+
+    // Read the window's own region of the screen and describe what is in it: the close button's cross,
+    // the plate the window buttons share, and button borders — none of which exist in a folded chip.
+    auto grab = [&](double atMs) {
+        FoldFrame frame;
+        frame.atMs = atMs;
+        RECT now{};
+        GetWindowRect(target, &now);
+        frame.width = now.right - now.left;
+        frame.left = now.left;
+        BitBlt(memory, 0, 0, width, height, screen, box.left, box.top, SRCCOPY);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;          // top-down
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        if (!GetDIBits(memory, bitmap, 0, height, pixels.data(), &info, DIB_RGB_COLORS)) return frame;
+        for (int y = 0; y < height; ++y) {
+            const unsigned char* row = pixels.data() + (size_t)y * width * 4;
+            int run = 0;
+            for (int x = 0; x < width; ++x) {
+                int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
+                if (std::abs(r - 185) <= 30 && std::abs(g - 28) <= 40 && std::abs(b - 28) <= 40) {
+                    ++frame.cross;
+                    if (frame.crossFrom < 0 || x < frame.crossFrom) frame.crossFrom = x;
+                    if (x > frame.crossTo) frame.crossTo = x;
+                } else if (std::abs(r - 203) <= 6 && std::abs(g - 213) <= 6 && std::abs(b - 225) <= 6) {
+                    ++frame.borders;
+                }
+                bool plate = std::abs(r - 248) <= 3 && std::abs(g - 250) <= 3 && std::abs(b - 252) <= 3;
+                run = plate ? run + 1 : 0;
+                if (run >= 20) {
+                    ++frame.plate;
+                    if (frame.plateFrom < 0 || x - run + 1 < frame.plateFrom) frame.plateFrom = x - run + 1;
+                    if (x > frame.plateTo) frame.plateTo = x;
+                }
+            }
+        }
+        return frame;
+    };
+
+    LARGE_INTEGER frequency{}, start{};
+    QueryPerformanceFrequency(&frequency);
+    auto nowMs = [&]() {
+        LARGE_INTEGER at{};
+        QueryPerformanceCounter(&at);
+        return (double)(at.QuadPart - start.QuadPart) * 1000.0 / (double)frequency.QuadPart;
+    };
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    auto click = [&]() {
+        SetCursorPos(whaleX, whaleY);
+        mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        Sleep(60);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        double at = nowMs();                         // the click that folds or unfolds
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        return at;
+    };
+
+    for (int round = 0; round < 2; ++round) {
+        std::vector<FoldFrame> frames;
+        Pump();
+        Sleep(400);                                  // settle, then start from a known shape
+        Pump();
+        double clickedAt = click();
+        double until = nowMs() + 600;
+        while (nowMs() < until) frames.push_back(grab(nowMs()));
+        Pump();
+        std::printf("\n%s: %d frames in %.0f ms (the double-click lands at t=%.1f ms)\n",
+            round == 0 ? "fold" : "unfold", (int)frames.size(), 600.0, clickedAt);
+        FoldFrame last{};
+        bool first = true;
+        for (const FoldFrame& frame : frames) {
+            if (!first && frame == last) continue;
+            std::printf("   %+7.2f ms  window %d wide at x=%d   cross=%d@[%d..%d] plate=%d@[%d..%d] borders=%d\n",
+                frame.atMs - clickedAt, frame.width, frame.left, frame.cross, frame.crossFrom,
+                frame.crossTo, frame.plate, frame.plateFrom, frame.plateTo, frame.borders);
+            last = frame;
+            first = false;
+        }
+        // Keep a picture of what the probe just looked at, so the shape can be checked with the eyes.
+        RECT now{};
+        GetWindowRect(target, &now);
+        if (round == 0) {
+            std::wstring chip = (fs::temp_directory_path() / L"dsh-probe-window-folded.png").wstring();
+            SaveScreenArea(chip.c_str(), now.left, now.top, now.right - now.left, now.bottom - now.top);
+            std::wstring crop = (fs::temp_directory_path() / L"dsh-probe-chip.png").wstring();
+            SaveScreenArea(crop.c_str(), now.right - Scaled(W_MINI), now.top, Scaled(W_MINI), Scaled(H_COLLAPSED));
+        } else {
+            std::wstring whole = (fs::temp_directory_path() / L"dsh-probe-window-unfolded.png").wstring();
+            SaveScreenArea(whole.c_str(), now.left, now.top, now.right - now.left, now.bottom - now.top);
+        }
+        Sleep(250);
+    }
+
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    std::printf("\nleft the launcher as it was found\n");
+    return 0;
+}
+
+// Save the part of the screen the test just looked at, so the shape can be looked at with the eyes as
+// well. GDI+ is started here because the test process never ran the launcher's entry point.
+static void SaveScreenArea(const wchar_t* path, int screenLeft, int screenTop, int width, int height) {
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    BitBlt(memory, 0, 0, width, height, screen, screenLeft, screenTop, SRCCOPY);
+    SelectObject(memory, previous);
+    GdiplusStartupInput input;
+    ULONG_PTR token = 0;
+    if (GdiplusStartup(&token, &input, nullptr) == Ok) {
+        Gdiplus::Bitmap image(bitmap, nullptr);
+        CLSID png{};
+        UINT count = 0, size = 0;
+        if (GetImageEncodersSize(&count, &size) == Ok && size) {
+            std::vector<BYTE> buffer(size);
+            auto* encoders = (ImageCodecInfo*)buffer.data();
+            if (GetImageEncoders(count, size, encoders) == Ok) {
+                for (UINT i = 0; i < count; ++i)
+                    if (std::wstring(encoders[i].MimeType) == L"image/png") { png = encoders[i].Clsid; break; }
+            }
+        }
+        if (png != CLSID{}) {
+            std::printf("saved %ls\n", path);
+            image.Save(path, &png, nullptr);
+        }
+        GdiplusShutdown(token);
+    }
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+}
+
 static void ReportScreen(const char* what, HWND barWindow) {
     Seen seen = LookAtScreen(barWindow);
     std::printf("      %-26s systemTrack=%-5d systemThumb=%-5d ourLine=%-5d white=%-5d other=%d\n",
@@ -577,6 +760,17 @@ static void ReportScreen(const char* what, HWND barWindow) {
 // A window that paints itself with the launcher's own paint code, so the title bar can be looked at
 // on the real screen. The swap the reader asked for is a question about pixels: whether the drawing
 // followed the rects, or stayed behind where the whale used to be.
+// The part of a window a region actually shows, in window coordinates. Folding is a region change, so
+// this is what says where the chip is.
+static RECT VisibleBox(HWND window) {
+    RECT box{};
+    if (HRGN region = CreateRectRgn(0, 0, 0, 0)) {
+        if (GetWindowRgn(window, region) != ERROR) GetRgnBox(region, &box);
+        DeleteObject(region);
+    }
+    return box;
+}
+
 static int probeTitleBarPaints = 0;   // how many times the probe window has painted itself
 
 static LRESULT CALLBACK ProbeTitleBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -642,7 +836,7 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
-static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
+static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int width, int height) {
     TitleBarPixels seen;
     HDC screen = GetDC(nullptr);
     HDC memory = CreateCompatibleDC(screen);
@@ -650,7 +844,7 @@ static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
     HGDIOBJ previous = SelectObject(memory, bitmap);
     RECT box{};
     GetWindowRect(window, &box);
-    BitBlt(memory, 0, 0, width, height, screen, box.left, box.top, SRCCOPY);
+    BitBlt(memory, 0, 0, width, height, screen, box.left + originX, box.top + originY, SRCCOPY);
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             COLORREF pixel = GetPixel(memory, x, y);
@@ -912,7 +1106,7 @@ static void RunScreenChecks() {
             InvalidateRect(bar, nullptr, TRUE);
             UpdateWindow(bar);
             Settle(150);
-            TitleBarPixels none = ScanTitleBar(bar, Scaled(W), Scaled(H_COLLAPSED));
+            TitleBarPixels none = ScanTitleBar(bar, 0, 0, Scaled(W), Scaled(H_COLLAPSED));
             Check(none.icon == 0 && none.red > 0,
                 "on screen: with no icon set only the window buttons are drawn, so the icon colour is meaningful");
 
@@ -920,7 +1114,7 @@ static void RunScreenChecks() {
             InvalidateRect(bar, nullptr, TRUE);
             UpdateWindow(bar);
             Settle(200);
-            TitleBarPixels seen = ScanTitleBar(bar, Scaled(W), Scaled(H_COLLAPSED));
+            TitleBarPixels seen = ScanTitleBar(bar, 0, 0, Scaled(W), Scaled(H_COLLAPSED));
             UiRect draw = IconDrawRect();
             std::printf("      title bar %d px wide: icon at x=%d..%d (%d px, rect %d..%d), close cross x=%d, "
                 "minimize dash x=%d, lamp x=%d..%d\n",
@@ -950,30 +1144,32 @@ static void RunScreenChecks() {
                   seen.dashFirstX < Scaled(firstButtonX),
                 "on screen: close and minimize sit inside the plate, in that order");
 
-            // Fold it the way the launcher folds it, and read the direction off the screen: the chip
-            // pulls its left edge in and keeps the right edge, so the lamp and the whale under the
-            // reader's pointer stay put. Keeping the left edge is what would throw the whale across.
+            // Fold it the way the launcher folds it, and check what the reader cares about: the window
+            // itself does not move — the chip is a region at its right end — so the lamp and the whale
+            // under the pointer stay exactly where they were.
             RECT before{};
-            int whaleBefore = 0;
             GetWindowRect(bar, &before);
-            whaleBefore = before.left + seen.firstX;
+            int whaleBefore = before.left + seen.firstX;
             mini = true;
             Layout();
             Settle(200);
-            TitleBarPixels folded = ScanTitleBar(bar, Scaled(W_MINI), Scaled(H_COLLAPSED));
             RECT after{};
             GetWindowRect(bar, &after);
-            std::printf("      folded chip %d px wide at x=%d: lamp x=%d..%d, icon x=%d..%d (screen %d, was %d)\n",
-                Scaled(W_MINI), (int)after.left, folded.lampFirstX, folded.lampLastX,
-                folded.firstX, folded.lastX, (int)after.left + folded.firstX, whaleBefore);
+            RECT chip = VisibleBox(bar);
+            TitleBarPixels folded = ScanTitleBar(bar, chip.left, 0, chip.right - chip.left + 1, Scaled(H_COLLAPSED));
+            int whaleAfter = after.left + chip.left + folded.firstX;
+            std::printf("      folded chip %d px wide, region x=%d..%d of the window at x=%d: "
+                "lamp x=%d..%d, icon x=%d..%d (screen %d, was %d)\n",
+                chip.right - chip.left + 1, (int)chip.left, (int)chip.right, (int)after.left,
+                folded.lampFirstX, folded.lampLastX, folded.firstX, folded.lastX, whaleAfter, whaleBefore);
             Check(folded.lamp > 0 && folded.icon > 0 && folded.lampLastX < folded.firstX,
                 "on screen: folded, the lamp is on the left and the whale on the right");
-            Check(folded.lampFirstX >= 0 && folded.lastX < Scaled(W_MINI),
+            Check(folded.lampFirstX >= 0 && folded.lastX < chip.right - chip.left + 1,
                 "on screen: both of the folded chip's controls are inside the narrow chip");
-            Check(after.right == before.right && after.left > before.left,
-                "on screen: folding takes the left edge in and leaves the right edge where it was");
-            Check(after.left + folded.firstX == whaleBefore,
-                "on screen: the whale does not jump when the chip folds, which is the point of folding left to right");
+            Check(after.left == before.left && after.right == before.right,
+                "on screen: folding does not move the window, so there is no geometry change to compose");
+            Check(whaleAfter == whaleBefore,
+                "on screen: the whale does not move when the chip folds, which is the point of folding this way");
             mini = false;
 
             if (appIcon) DestroyIcon(appIcon);
@@ -1153,6 +1349,7 @@ int wmain(int argc, wchar_t** argv) {
 
 static int RunChecks(int argc, wchar_t** argv) {
     if (argc > 1 && std::wstring(argv[1]) == L"--discover") { Discover(); return 0; }
+    if (argc > 1 && std::wstring(argv[1]) == L"--fold") return RunFoldProbe();
     if (argc > 1 && std::wstring(argv[1]) == L"--probe") {
         // Live: the same probe the launcher runs every five seconds, pointed at whatever service
         // is listening on the launcher's port right now, printed as the log line it produces.
@@ -1422,7 +1619,7 @@ static int RunChecks(int argc, wchar_t** argv) {
               miniIconRect.x + miniIconRect.w <= W_MINI,
             "both of the folded chip's controls still fit inside it");
         Check(!mini && LampRect().x == statusRect.x && IconRect().x == iconRect.x &&
-              (mini = true, LampRect().x == miniLampRect.x && IconRect().x == miniIconRect.x),
+              (mini = true, LampRect().x == miniOffsetX + miniLampX && IconRect().x == miniOffsetX + miniIconX),
             "the lamp and the whale rects follow the chip state, which is what the hit test uses");
         mini = false;
     }
@@ -1434,8 +1631,10 @@ static int RunChecks(int argc, wchar_t** argv) {
     Check(windowCornerEllipsePx == (int)(2 * cornerRadius),
         "the window region's corner ellipse is twice the painted radius, so shape and frame agree");
 
-    // Folding direction: the chip pulls its left edge in and leaves the right edge alone, so the lamp
-    // and the whale stay where they are. Driving the real Layout() is what shows it.
+    // Folding: the window itself neither moves nor resizes any more. That is the point — a geometry
+    // change is what made the compositor show the surface it already had at the new shape for a frame,
+    // which the reader saw as a flicker. The chip is a window region at the right edge instead, so
+    // these checks read the region, and the window rectangle is checked to stay exactly as it was.
     {
         HWND probe = MakeTitleBarWindow(-3000, -3000);
         if (!probe) {
@@ -1450,34 +1649,41 @@ static int RunChecks(int argc, wchar_t** argv) {
             Layout();
             RECT open{};
             GetWindowRect(probe, &open);
-            // Folding moves the window, so the paint has to happen before Layout returns: a queued paint
-            // leaves the compositor showing the unfolded surface at the folded position for a frame,
-            // which is the flicker at the moment of folding. The queued case is measured first, as the
-            // control that says the counter can tell the two apart.
+            RECT openBox = VisibleBox(probe);
+            // The paint has to happen inside Layout: a queued one leaves the compositor showing the
+            // surface it already has for a frame. The queued case is measured first, as the control
+            // that says the counter can tell the two apart.
             probeTitleBarPaints = 0;
             InvalidateRect(probe, nullptr, FALSE);
             Check(probeTitleBarPaints == 0,
-                "a queued repaint does not paint inside the call, which is what made folding flicker");
+                "a queued repaint does not paint inside the call, which is the frame the reader saw");
             probeTitleBarPaints = 0;
             mini = true;
             Layout();
-            Check(probeTitleBarPaints > 0,
-                "folding paints inside the same call, so no frame shows the old surface at the new place");
+            Check(probeTitleBarPaints > 0, "folding paints inside the same call, not one frame later");
             std::printf("      fold painted %d time(s) before returning\n", probeTitleBarPaints);
             RECT folded{};
             GetWindowRect(probe, &folded);
-            Check(folded.right == open.right && folded.left > open.left,
-                "folding moves the left edge right and leaves the right edge in place");
-            Check(folded.left - open.left == Scaled(W) - Scaled(W_MINI),
-                "the chip shrinks by exactly the width it gave up");
+            RECT foldedBox = VisibleBox(probe);
+            Check(folded.left == open.left && folded.top == open.top && folded.right == open.right,
+                "folding leaves the window rectangle alone, so there is no geometry change to compose");
+            // Regions exclude their right and bottom edges, so the box is one short of the size.
+            Check(foldedBox.left == Scaled(miniOffsetX) && foldedBox.right == Scaled(W) - 1 &&
+                  foldedBox.top == 0 && foldedBox.bottom == Scaled(H_COLLAPSED) - 1,
+                "the chip is a region at the window's right edge, of the chip's own width");
+            Check(openBox.left == 0 && openBox.right == Scaled(W) - 1 && openBox.bottom == Scaled(H_COLLAPSED) - 1,
+                "unfolded, the region covers the whole window");
             probeTitleBarPaints = 0;
             mini = false;
             Layout();
             RECT again{};
             GetWindowRect(probe, &again);
             Check(again.left == open.left && again.right == open.right,
-                "unfolding grows back to the left, landing exactly where it started");
+                "unfolding leaves the window where it was as well");
             Check(probeTitleBarPaints > 0, "unfolding paints inside the same call as well");
+            RECT back = VisibleBox(probe);
+            Check(back.left == 0 && back.right == Scaled(W) - 1 && back.bottom == Scaled(H_COLLAPSED) - 1,
+                "unfolding covers the whole window again");
             windowHandle = previousWindow;
             mini = previousMini; expanded = previousExpanded;
             DestroyWindow(probe);

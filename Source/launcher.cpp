@@ -93,10 +93,14 @@ static constexpr int logEditHeight = logBoxBottomPx - logBarZone - logTop;
 // without it the window's painting is not clipped away from the log box and its bars, and any erase
 // path that is not BeginPaint (which clips by itself) can touch them.
 static constexpr DWORD mainWindowStyle = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-// Folded down to the lamp and the whale; the rest of the chip drags. Folded, the lamp is on the left
-// and the whale on the right, which is the order the reader asked for in the narrow chip.
+// The chip's own controls, in chip coordinates.
 static constexpr int miniLampX = leftMargin, miniIconX = miniLampX + indicatorWidth + buttonGap;
 static constexpr int W_MINI = miniIconX + iconWidth + rightMargin;
+// Folded, the chip is the right end of a window that never changes width: the window rectangle stays
+// at W, and a region decides which part of it is the chip. Folding therefore moves no window and
+// resizes none, which is what keeps the compositor from showing the surface it already has at a new
+// geometry for a frame — the flicker the reader saw when folding moved the window instead.
+static constexpr int miniOffsetX = W - W_MINI;
 static constexpr USHORT serverPort = 3080;
 static constexpr int maxLogLines = 50'000;
 static constexpr int trimChunk = 500;
@@ -150,7 +154,6 @@ static bool autoRestart = false;          // the tray toggle: bring the service 
 static int autoRestartStreak = 0;         // automatic restarts in a row that have not settled yet
 static ULONGLONG autoRestartReadyAt = 0;  // when the running service last became ready
 static bool mini = false;
-static bool systemCorners = false;
 static bool stopping = false, updateAvailable = false, serverExternal = false;
 static std::atomic_bool serverReady{false};
 static State status = State::Missing;
@@ -185,9 +188,14 @@ static const UiRect iconRect{iconX, iconTop, iconWidth, iconHeight};
 static const UiRect miniIconRect{miniIconX, iconTop, iconWidth, iconHeight};
 static const UiRect miniLampRect{miniLampX, buttonTop, indicatorWidth, buttonHeight};
 // The lamp and the whale sit in different places folded and unfolded, so the paint and hit-test
-// paths ask for the rect instead of naming one.
-static UiRect LampRect() { return mini ? miniLampRect : statusRect; }
-static UiRect IconRect() { return mini ? miniIconRect : iconRect; }
+// paths ask for the rect instead of naming one. Folded they are the chip's own controls shifted to
+// the right end of a window that keeps its width.
+static UiRect LampRect() {
+    return mini ? UiRect{miniOffsetX + miniLampX, buttonTop, indicatorWidth, buttonHeight} : statusRect;
+}
+static UiRect IconRect() {
+    return mini ? UiRect{miniOffsetX + miniIconX, iconTop, iconWidth, iconHeight} : iconRect;
+}
 // Where the icon is actually drawn inside that rect. Derived rather than a pair of numbers, so the
 // drawing cannot be left behind at the old spot when the rect moves.
 static UiRect IconDrawRect() {
@@ -2383,22 +2391,21 @@ static void ToggleAutoRestart() {
 static int Scaled(int n) { return (int)(n * scaleFactor + .5f); }
 static void Layout() {
     if (!windowHandle) return;
-    int width = Scaled(mini ? W_MINI : W);
+    // The width never changes: the folded chip is a region of the same window rectangle, anchored to
+    // its right edge. Only the height follows the log panel, which keeps the top edge.
+    int width = Scaled(W);
     int height = Scaled(mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED));
-    // Folding and unfolding pull the left edge in and out and leave the right edge alone, so the chip
-    // collapses left-to-right and the lamp and the whale do not move: they sit the same distance from
-    // the right edge in both shapes, which is right where the reader's pointer already is. Keeping the
-    // left edge instead threw the whale from the right end of the title bar to the left.
     RECT current{};
     GetWindowRect(windowHandle, &current);
-    SetWindowPos(windowHandle, nullptr, current.right - width, current.top, width, height,
-        SWP_NOZORDER | SWP_NOACTIVATE);
-    if (!systemCorners)
-        // bRedraw FALSE: the system's own redraw here paints the window it is about to be told to
-        // repaint anyway, and it does it with the surface that is still in the compositor — which is
-        // the old content at the new position. One paint, below, is what avoids that.
-        SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width, height,
+    SetWindowPos(windowHandle, nullptr, current.left, current.top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    {
+        int left = mini ? Scaled(miniOffsetX) : 0;
+        int bottom = mini ? Scaled(H_COLLAPSED) : height;
+        // bRedraw FALSE: the paint below is the one that has to be seen, and the system's own redraw
+        // would use the surface as it still is.
+        SetWindowRgn(windowHandle, CreateRoundRectRgn(left, 0, width, bottom,
             Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+    }
     if (logEdit) {
         SetWindowPos(logEdit, nullptr, Scaled(logSide), Scaled(logTop), Scaled(logEditWidth), Scaled(logEditHeight), SWP_NOZORDER | SWP_NOACTIVATE);
         bool show = expanded && !mini;
@@ -2415,10 +2422,9 @@ static void Layout() {
         tipInfo.rect = {Scaled(lamp.x), Scaled(buttonTop), Scaled(lamp.x + indicatorWidth), Scaled(buttonTop + buttonHeight)};
         SendMessageW(tooltip, TTM_NEWTOOLRECTW, 0, (LPARAM)&tipInfo);
     }
-    // Paint it now rather than letting the message loop get to it. Folding moves the whole window, and
-    // a queued paint leaves the compositor showing the surface it already has — the unfolded title bar
-    // at the folded position — for at least one frame. That is the flicker at the moment of folding.
-    // UpdateWindow sends WM_PAINT straight away, so the new content is in the same frame as the move.
+    // Paint it now rather than letting the message loop get to it. The window's geometry does not
+    // change any more when it folds, so what the compositor has is always the right shape; this keeps
+    // its content in step with it within the same call.
     InvalidateRect(windowHandle, nullptr, FALSE);
     UpdateWindow(windowHandle);
 }
@@ -2540,11 +2546,16 @@ static void Paint() {
     HGDIOBJ old = SelectObject(memory, bitmap);
     Graphics g(memory); g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
     g.ScaleTransform(scaleFactor, scaleFactor);
-    int width = mini ? W_MINI : W;
+    // The whole surface is cleared, not just the part the region shows: the window keeps its width
+    // when it folds, and the part a region hides must not hold pixels waiting to appear when it grows
+    // back. What the reader sees of it is the chip box.
+    int chipLeft = mini ? miniOffsetX : 0;
+    int chipWidth = mini ? W_MINI : W;
     int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
-    SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, width, h);
-    if (!systemCorners) {
-        GraphicsPath frame; Rounded(frame,1.f,1.f,width-2.f,h-2.f,cornerRadius);
+    SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, W, H_EXPANDED);
+    {
+        GraphicsPath frame;
+        Rounded(frame,chipLeft + 1.f,1.f,chipWidth-2.f,h-2.f,cornerRadius);
         Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
     }
     DrawButton(g,LampRect(),L"",Button::Status);
@@ -2680,12 +2691,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_CREATE: {
         windowHandle = hwnd;
-        DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
-        systemCorners = SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners)));
-        if (systemCorners) {
-            COLORREF borderColor = RGB(169, 184, 204);
-            DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
-        }
+        // No DWM corner preference for the launcher itself: its shape is a window region now, because
+        // that is what folding uses, and the region and the frame painted inside it have to agree.
+        // (The right-click menus still ask DWM for their corners.)
         appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
         SendMessageW(hwnd,WM_SETICON,ICON_SMALL,(LPARAM)appIcon);
         logEdit = nullptr;
