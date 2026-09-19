@@ -66,7 +66,12 @@ static constexpr int leftMargin = 10, rightMargin = 14;
 static constexpr int titleButtonWidth = 25, titleClusterGap = 8;
 static constexpr int closeX = leftMargin;                 // close leads the row, minimize follows it
 static constexpr int minX = closeX + titleButtonWidth;
-static constexpr int firstButtonX = minX + titleButtonWidth + titleClusterGap;
+// The pair shares one painted plate, so both the plate and the divider that splits it are derived
+// from the left edge of the pair. Deriving them from one named button instead is what put the plate
+// over the first button and the divider on the outside edge when close and minimize swapped.
+static constexpr int titleClusterX = closeX;
+static constexpr int titleDividerX = titleClusterX + titleButtonWidth;
+static constexpr int firstButtonX = titleClusterX + 2 * titleButtonWidth + titleClusterGap;
 static constexpr int startX = firstButtonX;
 static constexpr int logX = startX + buttonWidth + buttonGap;
 static constexpr int updateX = logX + buttonWidth + buttonGap;
@@ -2524,7 +2529,7 @@ static void Paint() {
     DrawButton(g,updateRect,updateLabel,Button::Update,false,busy || serverRunning, UpdateTone());
     DrawButton(g,topRect,L"置顶",Button::Topmost,false,false,topmost ? Tone::Accent : Tone::Plain);
     GraphicsPath titlePath;
-    Rounded(titlePath,minRect.x + .5f,10.5f,(float)(2 * titleButtonWidth - 1),27,controlCornerRadius);
+    Rounded(titlePath,titleClusterX + .5f,10.5f,(float)(2 * titleButtonWidth - 1),27,controlCornerRadius);
     SolidBrush pale(Color(248,250,252));
     Pen light(Color(203,213,225),1); g.FillPath(&pale,&titlePath);
     if (hoverButton == Button::Minimize || hoverButton == Button::Close) {
@@ -2534,7 +2539,7 @@ static void Paint() {
         g.Restore(saved);
     }
     g.DrawPath(&light,&titlePath);
-    Pen divider(Color(226,232,240),1); g.DrawLine(&divider,closeRect.x,16,closeRect.x,32);
+    Pen divider(Color(226,232,240),1); g.DrawLine(&divider,titleDividerX,16,titleDividerX,32);
     Pen dash(Color(71,85,105),1.8f); g.DrawLine(&dash,minRect.x + 8,25,minRect.x + 17,25);
     Pen cross(Color(185,28,28),1.8f);
     g.DrawLine(&cross,closeRect.x + 8,19,closeRect.x + 16,29);

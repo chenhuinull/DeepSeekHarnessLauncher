@@ -637,7 +637,8 @@ static HICON MakeSolidIcon(int size, COLORREF color) {
 }
 
 struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1,
-                        dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1; };
+                        dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1,
+                        plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
     TitleBarPixels seen;
@@ -673,7 +674,35 @@ static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
                 ++seen.lamp;                      // the "not started" lamp, the one colour nothing else uses
                 if (seen.lampFirstX < 0 || x < seen.lampFirstX) seen.lampFirstX = x;
                 if (x > seen.lampLastX) seen.lampLastX = x;
+            } else if (std::abs((int)GetRValue(pixel) - 234) <= 25 &&
+                       std::abs((int)GetGValue(pixel) - 179) <= 30 &&
+                       std::abs((int)GetBValue(pixel) - 8) <= 40) {
+                ++seen.lamp;                      // the "not started" lamp, the one colour nothing else uses
+                if (seen.lampFirstX < 0 || x < seen.lampFirstX) seen.lampFirstX = x;
+                if (x > seen.lampLastX) seen.lampLastX = x;
             }
+        }
+    }
+    // The plate the two window buttons share is the same shade as a disabled button, and single
+    // antialiased pixels along the button borders land within tolerance of it too. Only a run as wide
+    // as the plate counts, so what comes back is the plate itself and not edge noise.
+    for (int y = Scaled(buttonTop) + 1; y <= Scaled(buttonTop + buttonHeight) - 1 && y < height; ++y) {
+        int run = 0;
+        for (int x = 0; x <= width; ++x) {
+            bool plate = false;
+            if (x < width) {
+                COLORREF pixel = GetPixel(memory, x, y);
+                plate = std::abs((int)GetRValue(pixel) - 248) <= 3 &&
+                        std::abs((int)GetGValue(pixel) - 250) <= 3 &&
+                        std::abs((int)GetBValue(pixel) - 252) <= 3;
+            }
+            if (plate) { ++run; continue; }
+            if (run >= 20) {
+                if (seen.plateFirstX < 0 || x - run < seen.plateFirstX) seen.plateFirstX = x - run;
+                if (x - 1 > seen.plateLastX) seen.plateLastX = x - 1;
+                seen.plate += run;
+            }
+            run = 0;
         }
     }
     SelectObject(memory, previous);
@@ -906,6 +935,18 @@ static void RunScreenChecks() {
             Check(seen.lamp > 0 && seen.lampFirstX > Scaled(W) / 2 && seen.lampLastX < seen.firstX &&
                   seen.firstX - seen.lampLastX <= Scaled(indicatorWidth),
                 "on screen: the lamp is drawn right beside the whale, both at the right end");
+            // The bug this replaced: the pair's plate was derived from the minimize button, so once
+            // close led the row the plate covered the left half of the start button and the divider
+            // was drawn on the outside edge. Both are read off the screen here.
+            std::printf("      plate x=%d..%d (first button starts at %d), divider at %d\n",
+                seen.plateFirstX, seen.plateLastX, Scaled(firstButtonX), Scaled(titleDividerX));
+            Check(seen.plate > 0 && seen.plateFirstX <= Scaled(titleClusterX) + 2,
+                "on screen: the window buttons' plate starts at the pair's own left edge");
+            Check(seen.plateLastX < Scaled(firstButtonX),
+                "on screen: the plate stops before the start button, so it cannot cover its label");
+            Check(seen.dash > 0 && seen.red > 0 && seen.redLastX < seen.dashFirstX &&
+                  seen.dashFirstX < Scaled(firstButtonX),
+                "on screen: close and minimize sit inside the plate, in that order");
 
             // Folded, the same two controls change places: lamp on the left, whale on the right.
             SetWindowPos(bar, nullptr, 0, 0, Scaled(W_MINI), Scaled(H_COLLAPSED), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1336,6 +1377,12 @@ static int RunChecks(int argc, wchar_t** argv) {
     {
         Check(closeRect.x < minRect.x && minRect.x + minRect.w <= firstButtonX,
             "close and minimize lead the title bar now, close first");
+        // The pair shares one plate and one divider; both must come from the pair's own edges, or the
+        // plate lands on the first button and the divider on the outside.
+        Check(titleClusterX == closeX && titleClusterX + 2 * titleButtonWidth <= firstButtonX,
+            "the shared plate covers both window buttons and stops before the first button");
+        Check(titleDividerX == minRect.x && titleDividerX == closeRect.x + closeRect.w,
+            "the divider between the two window buttons sits on their shared edge, not on the outside");
         Check(iconRect.x >= lastButtonRight && iconRect.x + iconRect.w <= W,
             "the whale closes the title bar, at the far right");
         Check(statusX == lastButtonRight + titleClusterGap &&
