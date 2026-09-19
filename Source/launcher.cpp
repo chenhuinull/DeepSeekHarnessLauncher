@@ -125,6 +125,11 @@ static int logMaxLineWidth = 0;         // widest line in the retained log, in p
 static int logMaxLineIndex = -1;        // which line that was, so a trim knows when to rescan
 static int logHorizontalOffset = 0;     // pixels the text is scrolled sideways
 static int logTextOriginX = INT_MIN;    // x of character 0 while the view is not scrolled
+// Entries that arrived while the reader was dragging a selection out of the log. Writing an entry
+// means moving the caret to the end of the text, and doing that under the pointer takes the drag's
+// anchor with it, so the selection collapses mid-gesture. The gesture ends when the button comes up.
+static std::vector<std::wstring> logDeferred;
+static constexpr size_t deferredLogCap = 4096;   // and a drag that lasts absurdly long stops holding
 static HWND tooltip;
 static TOOLINFOW tipInfo{};
 static float scaleFactor = 1.0f;
@@ -1313,6 +1318,7 @@ static void ClearLog() {
     logMaxLineWidth = 0;
     logMaxLineIndex = -1;
     logHorizontalOffset = 0;
+    logDeferred.clear();
     SetWindowTextW(logEdit, L"");
     InvalidateLogBars();
 }
@@ -1659,19 +1665,32 @@ static void CreateLogBars(HWND parent) {
         0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
 }
 
-static void AppendLog(const std::wstring& line) {
-    if (!logEdit) return;
+static std::wstring ComposeLogEntry(const std::wstring& line) {
     SYSTEMTIME now; GetLocalTime(&now);
     // No trailing space after the bracket: this font draws a space half a Chinese glyph wide, which
     // reads as a conspicuous gap between the timestamp and a Chinese message.
     wchar_t stamp[32]; wsprintfW(stamp, L"[%02d:%02d:%02d]", now.wHour, now.wMinute, now.wSecond);
     std::wstring entry = stamp; entry += line;
+    return entry;
+}
+
+// One entry into the box. Appending is a two-step move — put the caret at the end of the text, then
+// replace the (empty) selection there — and both steps used to take whatever the reader had selected
+// with them. The log streams while the service is talking, so a selection made to be copied was
+// regularly gone before the menu came up. The reader's range is therefore read before the insert and
+// put back after it, and the view is not scrolled to the caret in that case: it stays where the
+// reader left it, at the end of their own selection.
+static void WriteLogEntry(const std::wstring& entry) {
+    if (!logEdit) return;
     // The separator goes in front of the entry, never after it. Ending the text with a newline leaves
     // an empty line at the bottom that the view is pinned to, so the last line of the panel shows
     // nothing but white — the space the reader sees going to waste. This way the newest line is the
     // last line of the text and sits at the bottom of the box.
     bool first = GetWindowTextLengthW(logEdit) == 0;
     std::wstring appended = first ? entry : (L"\r\n" + entry);
+    DWORD selectedFrom = 0, selectedTo = 0;
+    SendMessageW(logEdit, EM_GETSEL, (WPARAM)&selectedFrom, (LPARAM)&selectedTo);
+    bool hadSelection = selectedTo > selectedFrom;
     // Append instead of rebuilding the whole box: with a 50k line cap a full
     // SetWindowText per line would be quadratic.
     int length = GetWindowTextLengthW(logEdit);
@@ -1682,6 +1701,7 @@ static void AppendLog(const std::wstring& line) {
     // character count would not describe the line's width.
     int width = LogLineWidth(entry);
     if (width > logMaxLineWidth) { logMaxLineWidth = width; logMaxLineIndex = logLineCount - 1; }
+    int dropped = 0;   // characters the trim below took off the front, which a kept range shifts by
     if (logLineCount > maxLogLines) {
         // Drop a whole chunk rather than one line: deleting from the front of an edit
         // control moves the remaining text, so doing it per line is needlessly costly.
@@ -1693,6 +1713,7 @@ static void AppendLog(const std::wstring& line) {
             SendMessageW(logEdit, EM_SETSEL, 0, cut);
             SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
             logLineCount -= excess;
+            dropped = cut;
             // Only a trim that drops the longest line costs a rescan of what is left.
             if (logMaxLineIndex >= 0) {
                 if (logMaxLineIndex < excess) RescanLogLineWidths();
@@ -1700,14 +1721,46 @@ static void AppendLog(const std::wstring& line) {
             }
         }
     }
-    // Park the caret at the start of the last line: it keeps the view pinned to the
-    // bottom without dragging it sideways for long lines.
-    int lastLine = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) - 1;
-    int lastStart = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)lastLine, 0);
-    if (lastStart >= 0) SendMessageW(logEdit, EM_SETSEL, lastStart, lastStart);
-    SendMessageW(logEdit, EM_SCROLLCARET, 0, 0);
+    if (hadSelection) {
+        // Back to the reader's own range, and no EM_SCROLLCARET: the two ends of it are inside what
+        // the box is already showing, so the view does not move either.
+        LONG from = (LONG)selectedFrom - dropped, to = (LONG)selectedTo - dropped;
+        if (from < 0) from = 0;
+        if (to < from) to = from;
+        SendMessageW(logEdit, EM_SETSEL, from, to);
+    } else {
+        // Park the caret at the start of the last line: it keeps the view pinned to the
+        // bottom without dragging it sideways for long lines.
+        int lastLine = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) - 1;
+        int lastStart = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)lastLine, 0);
+        if (lastStart >= 0) SendMessageW(logEdit, EM_SETSEL, lastStart, lastStart);
+        SendMessageW(logEdit, EM_SCROLLCARET, 0, 0);
+    }
     SyncLogHorizontalOffset();
     InvalidateLogBars();
+}
+
+// Entries held back while a drag is in progress. Called as soon as the button comes up (and before
+// the next entry is written), so a queued line waits no longer than the gesture it interrupted.
+static void FlushDeferredLog() {
+    if (logDeferred.empty() || !logEdit) return;
+    std::vector<std::wstring> queued;
+    queued.swap(logDeferred);
+    for (const std::wstring& entry : queued) WriteLogEntry(entry);
+}
+
+static void AppendLog(const std::wstring& line) {
+    if (!logEdit) return;
+    // The left button down means the reader is marking text: the control holds the capture for the
+    // whole drag, and the caret must not be moved out from under it until the button is released.
+    // The cap only exists so that a drag nobody ever finishes cannot queue without bound; past it
+    // the log wins, because losing the tail of the output is worse than a broken drag.
+    if (GetCapture() == logEdit && logDeferred.size() < deferredLogCap) {
+        logDeferred.push_back(ComposeLogEntry(line));
+        return;
+    }
+    FlushDeferredLog();
+    WriteLogEntry(ComposeLogEntry(line));
 }
 
 // dsh is started with --no-open, so the launcher decides: it reads the URL dsh printed
@@ -1931,11 +1984,14 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
         }
         break;
     case WM_MOUSEMOVE: {
-        // The pointer arrives: this is one of the two things that bring the bars out.
+        // The pointer arriving is one of the two things that bring the bars out. The move itself must
+        // go on to the control: an edit extends a selection by handling the moves between the button
+        // going down and coming up, so swallowing them here left a drag with nothing selected at all
+        // ("日志框里无法进行选择复制了") — only the keyboard and the menu could still make a selection.
         TRACKMOUSEEVENT leaving{sizeof(leaving), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&leaving);
         RefreshLogBars();
-        return 0;
+        break;
     }
     case WM_MOUSELEAVE:
         RefreshLogBars();
@@ -1953,6 +2009,9 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
     case WM_KEYUP:
     case WM_LBUTTONUP:
     case WM_LBUTTONDBLCLK:
+        // A drag that just ended is also the moment the entries it held back are due; the release
+        // has been through the control by now, so the selection is final.
+        if (message == WM_LBUTTONUP) FlushDeferredLog();
         SyncLogHorizontalOffset();
         RefreshLogBars();
         break;
@@ -1996,6 +2055,7 @@ static void CreateLogEdit(HWND parent) {
     }
     SendMessageW(logEdit,WM_SETFONT,(WPARAM)font,TRUE);
     logBackground = CreateSolidBrush(RGB(255,255,255));
+    logDeferred.clear();
     SetWindowSubclass(logEdit, LogEditProc, 1, 0);
     // A multiline edit defaults to a 30k character limit; the line cap is the only limit
     // this box should have, otherwise appends fail silently once it is hit.

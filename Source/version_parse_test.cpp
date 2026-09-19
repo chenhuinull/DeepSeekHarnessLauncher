@@ -59,7 +59,11 @@ static void Discover() {
 // itself and draws and drives two bars of its own in a narrow zone next to the painted border, so no
 // non-client strip is reserved and the text gets that space. The checks below cover that: the control
 // has no strip, the text box really is that much bigger, the launcher's own measurements follow the
-// content, and auto-follow, keyboard and the wheel still work.
+// content, auto-follow, keyboard and the wheel still work, and a selection can be made and kept —
+// reported as "日志框里无法进行选择复制了", which had two causes: the launcher's own mouse handling
+// swallowed the pointer moves an edit extends a selection with, so a drag selected nothing at all,
+// and every appended line parked the caret at the end of the text and took a selection made by
+// double-click or the keyboard with it.
 static void Pump() {
     MSG message{};
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -70,6 +74,30 @@ static void Pump() {
 
 static int FirstVisibleLine() {
     return logEdit ? (int)SendMessageW(logEdit, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
+}
+
+// What the menu's "复制" ends up doing, read back the way the reader would.
+static std::wstring ClipboardText() {
+    std::wstring text;
+    if (!OpenClipboard(nullptr)) return text;
+    if (HANDLE handle = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* data = (const wchar_t*)GlobalLock(handle)) {
+            text = data;
+            GlobalUnlock(handle);
+        }
+    }
+    CloseClipboard();
+    return text;
+}
+
+// Watches the log control from behind the launcher's own subclass: a message reaches this only if the
+// launcher passed it on with DefSubclassProc, which is exactly what an edit needs to extend a
+// selection from the pointer moves. Swallowing them was the reason "日志框里无法进行选择复制了": a drag
+// left nothing selected, because only the button going down and coming up reached the control.
+static LPARAM lastMoveSeen = 0;
+static LRESULT CALLBACK MoveWatcherProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (message == WM_MOUSEMOVE) lastMoveSeen = lp;
+    return DefSubclassProc(hwnd, message, wp, lp);
 }
 
 static void ParkCaretAtEnd() {
@@ -177,6 +205,66 @@ static void CheckLogBars() {
     SendMessageW(logEdit, WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)WHEEL_DELTA), MAKELPARAM(0, 0));
     Pump();
     Check(FirstVisibleLine() < beforeWheel, "a wheel notch scrolls the log back up");
+
+    // The reader's selection has to survive the output that keeps arriving. The log streams while the
+    // service is talking, and appending means moving the caret to the end of the text to insert: that
+    // took the selection with it, so "复制" was greyed out by the time the reader got the menu open.
+    {
+        ClearLog();
+        Pump();
+        for (int line = 0; line < 60; ++line) AppendLog(L"line " + std::to_wstring(line));
+        Pump();
+        int tail = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
+        Check(FirstVisibleLine() > 0, "with nothing selected the view still follows the output");
+
+        // The moves between button down and button up are what an edit extends a selection with, so
+        // the launcher's own mouse handling has to pass them on. This watcher sits behind it in the
+        // subclass chain and only sees a message the launcher forwarded; the coordinates are chosen so
+        // that a move made by the machine's own mouse cannot be mistaken for it.
+        RemoveWindowSubclass(logEdit, LogEditProc, 1);
+        SetWindowSubclass(logEdit, MoveWatcherProc, 1, 0);
+        SetWindowSubclass(logEdit, LogEditProc, 1, 0);
+        lastMoveSeen = 0;
+        LPARAM probe = MAKELPARAM(1234, 567);
+        SendMessageW(logEdit, WM_MOUSEMOVE, 0, probe);
+        Check(lastMoveSeen == probe,
+            "the pointer moves reach the control, which is what extends a drag selection");
+        RemoveWindowSubclass(logEdit, MoveWatcherProc, 1);
+
+        SendMessageW(logEdit, EM_SETSEL, 120, 180);
+        AppendLog(L"a line that arrives while the reader has something selected");
+        Pump();
+        LONG from = -1, to = -1;
+        Check(LogSelectionRange(from, to) && from == 120 && to == 180,
+            "a line arriving mid-read leaves the selection exactly where it was");
+        Check(FirstVisibleLine() < tail, "and the view stays with the selection rather than at the tail");
+
+        // What the selection says, read out of the box itself, so the clipboard check is against the
+        // text the reader sees marked rather than against a substring this file assumed.
+        int textLength = GetWindowTextLengthW(logEdit);
+        std::wstring whole(textLength + 1, L'\0');
+        whole.resize(GetWindowTextW(logEdit, whole.data(), textLength + 1));
+        std::wstring expected = whole.substr(120, 60);
+        SendMessageW(logEdit, WM_COPY, 0, 0);
+        std::wstring copied = ClipboardText();
+        Check(expected.size() == 60 && copied == expected,
+            "the selection is still what the menu's 复制 puts on the clipboard");
+
+        // The drag that makes a selection in the first place holds the control's capture for its whole
+        // length, and a write during it would move the caret out from under the pointer: those lines
+        // wait for the button to come up.
+        int before = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
+        SetCapture(logEdit);
+        AppendLog(L"queued while the button is down");
+        Check((int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) == before && logDeferred.size() == 1,
+            "a line that arrives during a drag waits instead of moving the caret");
+        ReleaseCapture();
+        SendMessageW(logEdit, WM_LBUTTONUP, 0, 0);
+        Pump();
+        Check((int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) == before + 1,
+            "the button coming up writes what the drag held back");
+        Check(logDeferred.empty(), "and nothing is left waiting after that");
+    }
 
     ClearLog();
     Pump();
@@ -509,6 +597,31 @@ static void RunScreenChecks() {
     SendMessageW(logEdit, EM_LINESCROLL, 0, -100000);
     PositionLogBars();
     Settle(250);
+
+    // A drag is how a selection is normally made, and it is the one gesture that needs the control to
+    // receive the moves between button down and button up. Real input on the real screen, because the
+    // control's own drag only behaves as it does for the reader when the button is really held.
+    {
+        RECT dragBox{};
+        GetWindowRect(logEdit, &dragBox);
+        int x = dragBox.left + 8, y = dragBox.top + 12;
+        // The frame is not the foreground window, so the first click is the window's, not the control's.
+        SetCursorPos(x, y);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        Settle((int)GetDoubleClickTime() + 100);   // out of double-click range: this is a drag, not a pair
+        SendMessageW(logEdit, EM_SETSEL, 0, 0);
+        SetCursorPos(x, y);
+        Pump();
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        for (int step = 1; step <= 6; ++step) { SetCursorPos(x + step * 20, y + step * 4); Settle(30); }
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        Settle(150);
+        LONG dragFrom = 0, dragTo = 0;
+        Check(LogSelectionRange(dragFrom, dragTo) && dragTo - dragFrom >= 10,
+            "on screen: dragging across the log selects the text under the pointer");
+        std::printf("      drag selected [%ld,%ld): %ld characters\n", dragFrom, dragTo, dragTo - dragFrom);
+    }
 
     // The bars belong to the reader's attention: with the pointer away from the box and nothing
     // selected they must not be on screen at all. The cursor is parked out of the way first so this is
