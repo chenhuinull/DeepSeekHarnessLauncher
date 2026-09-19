@@ -2435,7 +2435,6 @@ static void ShowTrayMenu() {
 // can refresh it without inventing a new detail line.
 static bool PaintLayeredChip();   // defined with the painting code below
 static void SetLayered(bool layered);
-static void ClipToChipBox();
 
 // Anything that changes how the panel looks goes through here. A layered window's WM_PAINT output is never
 // composited — its content is the bitmap the system was handed — so invalidating it would leave the stale
@@ -2564,16 +2563,10 @@ static void Layout() {
             InvalidateRect(windowHandle, nullptr, FALSE);
             UpdateWindow(windowHandle);
             SetLayered(true);
-            PaintLayeredChip();
-            // And then the region becomes the chip's own box and stays there for as long as the window is
-            // folded. The alpha channel is the real shape, but only where something composites it: a remote
-            // desktop or a screen grabber that reads the window's own surface instead showed the whole 338px
-            // window — white, framed, the unfolded window's own frame — around the chip, which is what the
-            // reader saw under ToDesk while dragging the folded window. A region is applied by the window
-            // manager itself and holds on every path, and a plain rectangle a hair larger than the rounded
-            // chip inside it clips none of the antialiased corner (a region rounded to the drawn radius does:
-            // measured, the corner arcs go from 215-226 up to 240, the clipped value).
-            ClipToChipBox();
+            // The region is what the window is clipped to until the alpha surface has really landed.
+            // Once it has, the region goes: the alpha channel is the shape now, and the region's own
+            // corner (a wider radius than the chip's) would clip the antialiased corners away again.
+            if (PaintLayeredChip()) SetWindowRgn(windowHandle, nullptr, FALSE);
         } else {
             // The other way round: dropping layered mode leaves the surface that is already there — the chip —
             // on screen for a frame, which is what the window looks like anyway, and the normal paint below
@@ -2921,30 +2914,20 @@ static bool PaintLayeredChip() {
     if (!applied) {
         // The surface could not be handed over (GDI or the compositor refused it). A layered window with
         // nothing in it is an invisible launcher, so fall back to the shape the fold path had already
-        // cut — the window keeps a region on the chip's box and paints through it the ordinary way. The
+        // cut: the window keeps a region on the chip's box and paints through it the ordinary way. The
         // antialiased corners are lost, the chip is not.
         SetLayered(false);
-        ClipToChipBox();
+        if (HRGN chip = CreateRoundRectRgn(Scaled(miniOffsetX), 0, Scaled(W) + 1, Scaled(H_COLLAPSED) + 1,
+                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)))
+            SetWindowRgn(windowHandle, chip, FALSE);
         InvalidateRect(windowHandle, nullptr, FALSE);
         UpdateWindow(windowHandle);
     }
     return applied;
 }
 
-// The shaded-out part of the window is not there to be captured. The folded chip's shape comes from the
-// alpha channel of the layered bitmap, and that is only the shape where something composites it: a remote
-// desktop or a screen grabber that reads the window's own surface shows the whole 338px window instead —
-// white, framed, the unfolded window's own frame around the chip, which is what the reader saw under ToDesk
-// while dragging the folded window. A region is applied by the window manager itself, so it holds on that
-// path too. The clip is the chip's plain box, a hair larger than the rounded chip inside it, so it takes
-// none of the antialiased corner with it; a region rounded to the drawn radius does (measured: the corner
-// arcs read 240 instead of 215-226).
-static void ClipToChipBox() {
-    if (!windowHandle) return;
-    if (HRGN box = CreateRectRgn(Scaled(miniOffsetX), 0, Scaled(W), Scaled(H_COLLAPSED)))
-        SetWindowRgn(windowHandle, box, FALSE);
-}
-
+// The folded chip is a layered window: its shape comes from the bitmap's alpha channel, so it must not also
+// carry a window region, whose aliased edge would cut the antialiased corners off again.
 static void SetLayered(bool layered) {
     if (!windowHandle) return;
     LONG_PTR style = GetWindowLongPtrW(windowHandle, GWL_EXSTYLE);
