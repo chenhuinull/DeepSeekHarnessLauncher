@@ -88,6 +88,17 @@ static constexpr DWORD readyProbeIntervalMs = 1'000;
 // stay alive while the web server inside it is gone.
 static constexpr DWORD healthProbeIntervalMs = 5'000;
 static constexpr int healthFailureThreshold = 3;
+// Auto restart, the tray toggle: wait a moment before pulling the service back up, back off when it
+// keeps failing, and give up after a few tries so a broken install cannot become an endless loop of
+// starts. A start that stays up for a minute counts as a success and clears the counter.
+static constexpr int maxAutoRestarts = 3;
+static constexpr DWORD autoRestartFirstDelayMs = 3'000;
+static constexpr DWORD autoRestartMaxDelayMs = 30'000;
+static constexpr ULONGLONG autoRestartSettledMs = 60'000;
+static constexpr UINT_PTR autoRestartTimerId = 1;
+// Shared with the "stopped, update available" lamp: a running service with auto restart armed is
+// purple too, and the two can never be on at once because that one needs a stopped service.
+static constexpr ARGB lampPurpleArgb = 0xFFA855F7;
 static constexpr float controlCornerRadius = 4.0f;   // buttons and the log box share this
 static constexpr DWORD updateCheckTimeoutMs = 20'000;
 // Versions this build is known to work with. Downloads stay reproducible and a
@@ -111,13 +122,16 @@ static ServerIdentity serverIdentity;
 static fs::path runtimeDir;
 static constexpr wchar_t serverJobName[] = L"Local\\DeepSeekHarnessLauncher.Server";
 static bool expanded = false, topmost = true, busy = false, serverRunning = false;
+static bool autoRestart = false;          // the tray toggle: bring the service back by itself
+static int autoRestartStreak = 0;         // automatic restarts in a row that have not settled yet
+static ULONGLONG autoRestartReadyAt = 0;  // when the running service last became ready
 static bool mini = false;
 static bool systemCorners = false;
 static bool stopping = false, updateAvailable = false, serverExternal = false;
 static std::atomic_bool serverReady{false};
 static State status = State::Missing;
 static Button hoverButton = Button::None;
-static std::wstring statusTip = L"未安装固件", updateLabel = L"更新", rollbackVersion;
+static std::wstring statusTip = L"未安装固件", statusDetail, updateLabel = L"更新", rollbackVersion;
 static int logLineCount = 0;
 static bool logHovered = false;         // the pointer is over the log box (or a bar is being dragged)
 static bool logSelected = false;        // the log has a selection to look at
@@ -2119,10 +2133,11 @@ static NOTIFYICONDATAW trayIconData{};
 static bool trayIconAdded = false;
 static UINT taskbarCreatedMessage = 0;
 static void OnClick(Button button);
+static void ToggleAutoRestart();
 
 static std::wstring StatusName() {
     switch (status) {
-    case State::Running: return L"已启动";
+    case State::Running: return autoRestart ? L"已启动，自动重启已开启" : L"已启动";
     case State::Stopped: return L"未启动";
     case State::Update: return L"未启动，有更新";
     case State::Unresponsive: return L"已启动，服务无响应";
@@ -2172,14 +2187,24 @@ static void ToggleLauncherWindow() {
     else ShowLauncherWindow();
 }
 
-static void ShowTrayMenu() {
+// The tray menu items and the popup are built together here, on their own, so the regression checks
+// can look at the items without ever showing the popup.
+static constexpr UINT trayToggleWindow = 1, trayToggleService = 2, trayExit = 3, trayToggleAutoRestart = 4;
+static HMENU BuildTrayMenu() {
     HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    AppendMenuW(menu, MF_STRING, 1, IsWindowVisible(windowHandle) ? L"隐藏窗口" : L"显示窗口");
-    AppendMenuW(menu, MF_STRING, 2, serverRunning ? L"停止服务" : L"启动服务");
-    if (busy) EnableMenuItem(menu, 2, MF_BYCOMMAND | MF_GRAYED);
+    if (!menu) return nullptr;
+    AppendMenuW(menu, MF_STRING, trayToggleWindow, IsWindowVisible(windowHandle) ? L"隐藏窗口" : L"显示窗口");
+    AppendMenuW(menu, MF_STRING, trayToggleService, serverRunning ? L"停止服务" : L"启动服务");
+    if (busy) EnableMenuItem(menu, trayToggleService, MF_BYCOMMAND | MF_GRAYED);
+    AppendMenuW(menu, MF_STRING | (autoRestart ? MF_CHECKED : MF_UNCHECKED), trayToggleAutoRestart, L"自动重启");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 3, L"退出启动器");
+    AppendMenuW(menu, MF_STRING, trayExit, L"退出启动器");
+    return menu;
+}
+
+static void ShowTrayMenu() {
+    HMENU menu = BuildTrayMenu();
+    if (!menu) return;
     POINT cursor{};
     GetCursorPos(&cursor);
     if (IsWindowVisible(windowHandle)) SetForegroundWindow(windowHandle);
@@ -2188,17 +2213,74 @@ static void ShowTrayMenu() {
         cursor.x, cursor.y, 0, windowHandle, nullptr);
     DestroyMenu(menu);
     PostMessageW(windowHandle, WM_NULL, 0, 0);
-    if (command == 1) ToggleLauncherWindow();
-    else if (command == 2) OnClick(Button::Start);      // same path as the window button
-    else if (command == 3) DestroyWindow(windowHandle);
+    if (command == trayToggleWindow) ToggleLauncherWindow();
+    else if (command == trayToggleService) OnClick(Button::Start);   // same path as the window button
+    else if (command == trayToggleAutoRestart) ToggleAutoRestart();
+    else if (command == trayExit) DestroyWindow(windowHandle);
+}
+
+// The tip is rebuilt from the current status name, so a toggle that changes the name (auto restart)
+// can refresh it without inventing a new detail line.
+static void RefreshStatusTip() {
+    std::wstring name = StatusName();
+    statusTip = statusDetail.empty() ? name : name + L" · " + statusDetail;
+    if (tooltip) { tipInfo.lpszText = statusTip.data(); SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&tipInfo); }
+    UpdateTrayTip();
 }
 
 static void SetStatus(State state, const std::wstring& detail) {
     status = state;
-    std::wstring name = StatusName();
-    statusTip = name + L" · " + detail;
-    if (tooltip) { tipInfo.lpszText = statusTip.data(); SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&tipInfo); }
-    UpdateTrayTip();
+    statusDetail = detail;
+    RefreshStatusTip();
+    InvalidateRect(windowHandle, nullptr, FALSE);
+}
+
+// Backoff for the automatic restarts: 3s, 6s, 12s, ... capped at 30s.
+static DWORD AutoRestartDelayMs(int streak) {
+    DWORD delay = autoRestartFirstDelayMs;
+    for (int i = 0; i < streak && delay < autoRestartMaxDelayMs; ++i) delay *= 2;
+    return delay > autoRestartMaxDelayMs ? autoRestartMaxDelayMs : delay;
+}
+
+// A start that stayed up for a minute counts as a success, so one bad moment does not leave the
+// launcher permanently backed off (and does not use up the give-up budget).
+static bool AutoRestartSettled(ULONGLONG readyAt, ULONGLONG now) {
+    return readyAt != 0 && now - readyAt >= autoRestartSettledMs;
+}
+
+// One place decides whether to try again, so both failure paths (the service exited on its own, and
+// the health probe found it silent) go through the same counter, backoff and give-up rule.
+static void ScheduleAutoRestart(const std::wstring& why) {
+    ULONGLONG now = GetTickCount64();
+    if (AutoRestartSettled(autoRestartReadyAt, now)) autoRestartStreak = 0;
+    if (autoRestartStreak >= maxAutoRestarts) {
+        autoRestart = false;
+        AppendLog(L"自动重启已连续失败 " + std::to_wstring(autoRestartStreak) + L" 次，已自动关闭该功能；"
+            L"请查看日志后手动启动。");
+        RefreshStatusTip();
+        InvalidateRect(windowHandle, nullptr, FALSE);
+        return;
+    }
+    DWORD delay = AutoRestartDelayMs(autoRestartStreak);
+    ++autoRestartStreak;
+    AppendLog(why + L"自动重启（第 " + std::to_wstring(autoRestartStreak) + L"/" +
+        std::to_wstring(maxAutoRestarts) + L" 次）将在 " + std::to_wstring(delay / 1000) +
+        L" 秒后重新启动服务。");
+    SetTimer(windowHandle, autoRestartTimerId, delay, nullptr);
+}
+
+static void ToggleAutoRestart() {
+    autoRestart = !autoRestart;
+    if (autoRestart) {
+        autoRestartStreak = 0;
+        autoRestartReadyAt = (serverRunning && serverReady) ? GetTickCount64() : 0;
+        AppendLog(L"已开启自动重启：服务无响应或意外退出后会自动重新启动。");
+    } else {
+        KillTimer(windowHandle, autoRestartTimerId);
+        autoRestartReadyAt = 0;
+        AppendLog(L"已关闭自动重启。");
+    }
+    RefreshStatusTip();
     InvalidateRect(windowHandle, nullptr, FALSE);
 }
 
@@ -2265,9 +2347,11 @@ static void InvalidateButton(Button button) {
 
 static Color ColorForStatus() {
     switch (status) {
-    case State::Running: return Color(34,197,94);
+    // A running service with auto restart armed is purple: the reader asked for a colour that says
+    // "this one picks itself back up". Green stays for a plain run.
+    case State::Running: return autoRestart ? Color(lampPurpleArgb) : Color(34,197,94);
     case State::Stopped: return Color(234,179,8);
-    case State::Update: return Color(168,85,247);
+    case State::Update: return Color(lampPurpleArgb);
     // Amber, not the yellow of "not started": the process is up, the service is not.
     case State::Unresponsive: return Color(249,115,22);
     default: return Color(239,68,68);
@@ -2413,7 +2497,7 @@ static void OnClick(Button button) {
             stopping = true; busy = true;
             if (TerminateServer(id)) SetStatus(State::Stopped,L"正在关闭 Web 服务…");
             else { busy = false; stopping = false; AppendLog(L"停止失败：无法结束 Web 服务进程。"); }
-        } else { serverReady = false; BeginWork(Work::Start); }
+        } else { serverReady = false; autoRestartStreak = 0; autoRestartReadyAt = 0; BeginWork(Work::Start); }
         break;
     case Button::Update:
         if (busy || serverRunning) break;
@@ -2585,10 +2669,14 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_SERVER_STARTED: serverRunning=true; serverExternal=false; busy=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
     case WM_SERVER_ADOPTED:
         serverRunning=true; serverReady=true; serverExternal=true; busy=false;
+        autoRestartReadyAt=GetTickCount64();
+        KillTimer(hwnd,autoRestartTimerId);
         SetStatus(State::Running,L"检测到已在运行的 Web 服务（PID "+std::to_wstring((DWORD)wp)+L"），已接管；点击“停止”可结束它。");
         InvalidateRect(hwnd,nullptr,FALSE); return 0;
     case WM_SERVER_READY:
         serverReady=true;
+        autoRestartReadyAt=GetTickCount64();
+        KillTimer(hwnd,autoRestartTimerId);   // this start made it, so a pending retry is off
         if(!serverExternal) SaveKnownGoodVersion(Version());
         rollbackVersion.clear(); updateLabel=L"更新";
         SetStatus(State::Running,L"Web 服务已就绪；访问地址见运行日志。");
@@ -2601,6 +2689,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
             : L"端口 "+std::to_wstring((int)serverPort)+L" 已无监听；进程还在，但 Web 服务已经不在了。");
         AppendLog(wp ? L"Web 服务无响应（端口仍有监听，但没有应答），状态灯已变为橙色。"
                     : L"Web 服务已停止监听（端口无监听，进程仍在），状态灯已变为橙色。");
+        if (autoRestart) {
+            // The process is up but the web server inside it is not: end it and let the exit handler
+            // schedule the restart, so both failure paths share one counter and one backoff. This is
+            // not the user asking for a stop, so the exit that follows counts as unexpected.
+            ServerIdentity id;
+            { std::lock_guard lock(processMutex); id = serverIdentity; }
+            AppendLog(L"自动重启已介入：正在结束无响应的服务进程（PID "+std::to_wstring(id.pid)+L"）。");
+            if (!TerminateServer(id)) AppendLog(L"自动重启：无法结束该进程，请手动处理。");
+        }
         return 0;
     case WM_SERVER_HEALTHY:
         if (!serverRunning || status != State::Unresponsive) return 0;
@@ -2610,6 +2707,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_SERVER_EXIT: {
         if (!serverRunning && !busy) return 0;
         bool failed=!stopping&&!serverReady;
+        bool unexpected=!stopping;          // nobody asked for this exit, and auto restart wants to know
         serverRunning=false; busy=false; serverReady=false; serverExternal=false;
         std::wstring known=KnownGoodVersion();
         if(failed&&!known.empty()&&known!=Version()) {
@@ -2624,8 +2722,20 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if(failed&&!rollbackVersion.empty())
             AppendLog(L"上次可用版本是 "+rollbackVersion+L"，“更新”按钮已变为橙色，点击即可回退。");
         if(failed) ExpandLog(true);
-        stopping=false; InvalidateRect(hwnd,nullptr,FALSE); return 0;
+        stopping=false; InvalidateRect(hwnd,nullptr,FALSE);
+        if(unexpected&&autoRestart&&!closing) ScheduleAutoRestart(failed?L"服务未能启动，":L"服务意外退出，");
+        return 0;
     }
+    case WM_TIMER:
+        if (wp == autoRestartTimerId) {
+            KillTimer(hwnd,autoRestartTimerId);
+            if (autoRestart&&!closing&&!serverRunning) {
+                AppendLog(L"自动重启：正在重新启动 Web 服务…");
+                serverReady=false; BeginWork(Work::Start);
+            }
+            return 0;
+        }
+        break;
     case WM_INITMENUPOPUP: {
         // Popup menus are a "#32768" window owned by the shell, so their frame is square by
         // default. Round it and give it the launcher's border colour so both menus match the

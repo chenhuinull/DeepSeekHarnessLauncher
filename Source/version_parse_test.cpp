@@ -1066,6 +1066,50 @@ static int RunChecks(int argc, wchar_t** argv) {
             "a page that is not the harness is reported as such rather than as a healthy server");
     }
 
+    // Auto restart, the tray toggle: both failure paths share one counter and one backoff, a give-up
+    // rule stops a broken install from looping, and the lamp turns purple while it is armed and running.
+    {
+        Check(AutoRestartDelayMs(0) == 3000 && AutoRestartDelayMs(1) == 6000 && AutoRestartDelayMs(2) == 12000,
+            "the automatic restart backs off: 3s, then 6s, then 12s");
+        Check(AutoRestartDelayMs(9) == autoRestartMaxDelayMs,
+            "the backoff is capped, so the launcher never waits minutes between tries");
+        Check(AutoRestartSettled(100000, 100000 + autoRestartSettledMs) &&
+              !AutoRestartSettled(100000, 100000 + autoRestartSettledMs - 1) &&
+              !AutoRestartSettled(0, 500000),
+            "a start that stayed up a minute clears the counter, and a service that never started cannot");
+
+        autoRestart = false;
+        HMENU menu = BuildTrayMenu();
+        Check(menu && GetMenuItemCount(menu) == 5,
+            "the tray menu carries the window, service, auto restart and exit items plus a separator");
+        wchar_t label[32]{};
+        GetMenuStringW(menu, 2, label, 32, MF_BYPOSITION);
+        Check(std::wstring(label) == L"自动重启" && (GetMenuState(menu, 2, MF_BYPOSITION) & MF_CHECKED) == 0,
+            "the tray menu offers an auto restart item, unticked while the feature is off");
+        DestroyMenu(menu);
+        autoRestart = true;
+        menu = BuildTrayMenu();
+        Check(menu && (GetMenuState(menu, 2, MF_BYPOSITION) & MF_CHECKED) != 0,
+            "the auto restart item is ticked while the feature is on");
+        DestroyMenu(menu);
+
+        status = State::Running;
+        Check(ColorForStatus().GetValue() == 0xFFA855F7u,
+            "a running service with auto restart armed shows the purple lamp");
+        autoRestart = false;
+        Check(ColorForStatus().GetValue() == 0xFF22C55Eu, "without it the running lamp stays green");
+        autoRestart = true;
+        Check(StatusName().find(L"自动重启") != std::wstring::npos, "the status says auto restart is on");
+        status = State::Unresponsive;
+        Check(ColorForStatus().GetValue() == 0xFFF97316u,
+            "an unresponsive service keeps its amber lamp even with auto restart armed");
+        status = State::Update;
+        Check(ColorForStatus().GetValue() == 0xFFA855F7u,
+            "the update lamp shares that purple, which is safe because it needs a stopped service");
+        autoRestart = false;
+        status = State::Missing;
+    }
+
     CheckLogBars();
 
     CheckParentRepaint();
