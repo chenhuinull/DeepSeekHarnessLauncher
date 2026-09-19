@@ -2422,6 +2422,14 @@ static void ApplySystemFrame() {
     DwmSetWindowAttribute(windowHandle, DWMWA_BORDER_COLOR, &border, sizeof(border));
 }
 
+// The folded chip is drawn into a 32-bit ARGB bitmap and handed to the system in one call, instead of
+// being cut out of the window by a region and framed by hand. A region's edge has no antialiasing at all:
+// the silhouette was a staircase, the frame drawn inside it never quite reached that edge, and the reader
+// saw both. Here the silhouette, the border, the lamp and the whale are painted together, so the corners
+// are as smooth as the ones DWM draws for the unfolded window. The window rectangle and the region are
+// left alone, so folding still moves nothing and shows no stale frame.
+static void PaintLayeredChip();   // defined with the painting code below
+static void SetLayered(bool layered);
 static void Layout() {
     if (!windowHandle) return;
     // The width never changes: the folded chip is a region of the same window rectangle, anchored to
@@ -2434,18 +2442,35 @@ static void Layout() {
     ApplySystemFrame();
     {
         // The unfolded window keeps its rectangle and lets DWM round the corners and draw the border, which
-        // is antialiased and smooth. The region is only for the folded chip, where half of the window has to
-        // be cut away; on systems without DWM corners the window rounds itself with a region and paints its
-        // own frame, the way it does when folded.
+        // is antialiased and smooth. The folded chip is a layered window instead, whose alpha channel is its
+        // shape; on systems without DWM corners the unfolded window rounds itself with a region and paints
+        // its own frame.
         if (mini) {
-            int left = Scaled(miniOffsetX);
-            SetWindowRgn(windowHandle, CreateRoundRectRgn(left, 0, width + 1, Scaled(H_COLLAPSED) + 1,
-                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
-        } else if (systemCorners) {
+            // Switching a window to layered mode is not atomic: the compositor keeps showing the old surface
+            // for a frame. So the window is clipped to the chip first — a region change is what is atomic,
+            // and the chip's box in the unfolded window already holds the lamp, the whale and white, which
+            // is what the chip looks like — and only then is the antialiased version handed over. Either the
+            // whole switch lands inside one frame, or the frame in between shows the same picture.
+            SetWindowRgn(windowHandle, CreateRoundRectRgn(Scaled(miniOffsetX), 0, width + 1,
+                Scaled(H_COLLAPSED) + 1, Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+            InvalidateRect(windowHandle, nullptr, FALSE);
+            UpdateWindow(windowHandle);
+            SetLayered(true);
+            PaintLayeredChip();
+            // And the region goes: the alpha channel is the shape now, and the region's own corner (a wider
+            // radius than the chip's) would otherwise clip the antialiased corners away again.
             SetWindowRgn(windowHandle, nullptr, FALSE);
         } else {
-            SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width + 1, height + 1,
-                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+            // The other way round: dropping layered mode leaves the surface that is already there — the chip —
+            // on screen for a frame, which is what the window looks like anyway, and the normal paint below
+            // then fills in the unfolded title bar.
+            SetLayered(false);
+            if (systemCorners) {
+                SetWindowRgn(windowHandle, nullptr, FALSE);
+            } else {
+                SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width + 1, height + 1,
+                    Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+            }
         }
     }
     if (logEdit) {
@@ -2466,9 +2491,12 @@ static void Layout() {
     }
     // Paint it now rather than letting the message loop get to it. The window's geometry does not
     // change any more when it folds, so what the compositor has is always the right shape; this keeps
-    // its content in step with it within the same call.
-    InvalidateRect(windowHandle, nullptr, FALSE);
-    UpdateWindow(windowHandle);
+    // its content in step with it within the same call. A layered chip has already been handed over whole,
+    // and a layered window's WM_PAINT output goes nowhere anyway.
+    if (!mini) {
+        InvalidateRect(windowHandle, nullptr, FALSE);
+        UpdateWindow(windowHandle);
+    }
 }
 
 static void ExpandLog(bool value) { if (expanded == value) return; expanded = value; Layout(); }
@@ -2700,6 +2728,85 @@ static void Paint() {
     }
     BitBlt(hdc,0,0,client.right,client.bottom,memory,0,0,SRCCOPY);
     SelectObject(memory,old); DeleteObject(bitmap); DeleteDC(memory); EndPaint(windowHandle,&ps);
+}
+
+static void PaintLayeredChip() {
+    if (!windowHandle) return;
+    const int width = Scaled(W), height = Scaled(H_COLLAPSED);
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = width;
+    header.bV5Height = -height;                 // top-down, like the rest of the painting here
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00FF0000;
+    header.bV5GreenMask = 0x0000FF00;
+    header.bV5BlueMask = 0x000000FF;
+    header.bV5AlphaMask = 0xFF000000;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screen, (BITMAPINFO*)&header, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!dib || !bits) { if (dib) DeleteObject(dib); return; }
+    memset(bits, 0, (size_t)width * height * 4);          // nothing of the window is opaque to begin with
+    {
+        // GDI+ writes proper alpha into those bits when the bitmap wraps them, which a compatible DC would
+        // not: drawing through a DC leaves the alpha channel at zero and the chip would be invisible.
+        Gdiplus::Bitmap canvas(width, height, width * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Gdiplus::Graphics g(&canvas);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        const float left = (float)Scaled(miniOffsetX), top = 0.f;
+        const float chipW = (float)Scaled(W_MINI), chipH = (float)height;
+        // The white inside is filled first, then the border is stroked on top with a 1px pen. Measured, GDI+
+        // renders a stroked path half a pixel to the right of its coordinates here, so the path is put on
+        // whole pixels and the stroke lands exactly on one column (or row) of the grid — filling two rounded
+        // rectangles and taking the difference instead left the straight sides at half coverage over two
+        // columns. The corners stay antialiased because the path's arcs are.
+        GraphicsPath border;
+        Rounded(border, left, top, chipW - 1.f, chipH - 1.f, cornerRadius - 0.5f);
+        SolidBrush white(Color::White);
+        g.FillPath(&white, &border);
+        Pen edge(Color(windowBorderArgb), 1.0f);
+        g.DrawPath(&edge, &border);
+        DrawButton(g, LampRect(), L"", Button::Status);
+        SolidBrush dot{ColorForStatus()};
+        UiRect lamp = LampRect();
+        g.FillEllipse(&dot, lamp.x + (indicatorWidth - lampDotDiameter) / 2,
+            buttonTop + (buttonHeight - lampDotDiameter) / 2, lampDotDiameter, lampDotDiameter);
+        if (appIcon) {
+            UiRect icon = IconDrawRect();
+            if (Gdiplus::Bitmap* glyph = Gdiplus::Bitmap::FromHICON(appIcon)) {
+                g.DrawImage(glyph, RectF((float)icon.x, (float)icon.y, (float)icon.w, (float)icon.h),
+                    0.f, 0.f, (float)glyph->GetWidth(), (float)glyph->GetHeight(), UnitPixel);
+                delete glyph;
+            }
+        }
+    }
+    HDC memory = CreateCompatibleDC(nullptr);
+    if (memory) {
+        HGDIOBJ previous = SelectObject(memory, dib);
+        SIZE size{width, height};
+        POINT source{0, 0};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UpdateLayeredWindow(windowHandle, nullptr, nullptr, &size, memory, &source, 0, &blend, ULW_ALPHA);
+        SelectObject(memory, previous);
+        DeleteDC(memory);
+    }
+    DeleteObject(dib);
+}
+
+// The folded chip is a layered window: its shape comes from the bitmap's alpha channel, so it must not also
+// carry a window region, whose aliased edge would cut the antialiased corners off again.
+static void SetLayered(bool layered) {
+    if (!windowHandle) return;
+    LONG_PTR style = GetWindowLongPtrW(windowHandle, GWL_EXSTYLE);
+    bool has = (style & WS_EX_LAYERED) != 0;
+    if (has == layered) return;
+    SetWindowLongPtrW(windowHandle, GWL_EXSTYLE, layered ? (style | WS_EX_LAYERED) : (style & ~WS_EX_LAYERED));
+    SetWindowPos(windowHandle, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 static void BeginWork(Work work) {

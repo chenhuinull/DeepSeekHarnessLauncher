@@ -577,11 +577,11 @@ static Seen LookAtScreen(HWND barWindow) {
 struct FoldFrame {
     double atMs = 0;
     int width = 0, left = 0;
-    int cross = 0, plate = 0, borders = 0;
+    int cross = 0, plate = 0, borders = 0, whale = 0;
     int crossFrom = -1, crossTo = -1, plateFrom = -1, plateTo = -1;
     bool operator==(const FoldFrame& other) const {
         return width == other.width && left == other.left && cross == other.cross &&
-            plate == other.plate && borders == other.borders;
+            plate == other.plate && borders == other.borders && whale == other.whale;
     }
 };
 
@@ -632,6 +632,9 @@ static int RunFoldProbe() {
             int run = 0;
             for (int x = 0; x < width; ++x) {
                 int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
+                // The whale is the only strongly blue thing in the window, so counting it says whether the
+                // chip is on screen at all — a frame with none of it is a frame with no window.
+                if (b > 150 && r < 120 && g < 140) ++frame.whale;
                 if (std::abs(r - 185) <= 30 && std::abs(g - 28) <= 40 && std::abs(b - 28) <= 40) {
                     ++frame.cross;
                     if (frame.crossFrom < 0 || x < frame.crossFrom) frame.crossFrom = x;
@@ -688,9 +691,9 @@ static int RunFoldProbe() {
         bool first = true;
         for (const FoldFrame& frame : frames) {
             if (!first && frame == last) continue;
-            std::printf("   %+7.2f ms  window %d wide at x=%d   cross=%d@[%d..%d] plate=%d@[%d..%d] borders=%d\n",
+            std::printf("   %+7.2f ms  window %d wide at x=%d   cross=%d@[%d..%d] plate=%d@[%d..%d] whale=%d borders=%d\n",
                 frame.atMs - clickedAt, frame.width, frame.left, frame.cross, frame.crossFrom,
-                frame.crossTo, frame.plate, frame.plateFrom, frame.plateTo, frame.borders);
+                frame.crossTo, frame.plate, frame.plateFrom, frame.plateTo, frame.whale, frame.borders);
             last = frame;
             first = false;
         }
@@ -1339,8 +1342,8 @@ static void RunScreenChecks() {
                 "on screen: close and minimize sit inside the plate, in that order");
 
             // Fold it the way the launcher folds it, and check what the reader cares about: the window
-            // itself does not move — the chip is a region at its right end — so the lamp and the whale
-            // under the pointer stay exactly where they were.
+            // itself does not move — the chip is the right end of it — so the lamp and the whale under the
+            // pointer stay exactly where they were.
             RECT before{};
             GetWindowRect(bar, &before);
             int whaleBefore = before.left + seen.firstX;
@@ -1349,20 +1352,23 @@ static void RunScreenChecks() {
             Settle(200);
             RECT after{};
             GetWindowRect(bar, &after);
-            RECT chip = VisibleBox(bar);
-            TitleBarPixels folded = ScanTitleBar(bar, chip.left, 0, chip.right - chip.left + 1, Scaled(H_COLLAPSED));
-            int whaleAfter = after.left + chip.left + folded.firstX;
-            std::printf("      folded chip %d px wide, region x=%d..%d of the window at x=%d: "
+            // The chip is a layered window now, so its box comes from the layout rather than from a region.
+            const int chipLeft = Scaled(miniOffsetX);
+            TitleBarPixels folded = ScanTitleBar(bar, chipLeft, 0, Scaled(W_MINI), Scaled(H_COLLAPSED));
+            int whaleAfter = after.left + chipLeft + folded.firstX;
+            std::printf("      folded chip %d px wide at window x=%d (window at x=%d): "
                 "lamp x=%d..%d, icon x=%d..%d (screen %d, was %d)\n",
-                chip.right - chip.left + 1, (int)chip.left, (int)chip.right, (int)after.left,
+                Scaled(W_MINI), chipLeft, (int)after.left,
                 folded.lampFirstX, folded.lampLastX, folded.firstX, folded.lastX, whaleAfter, whaleBefore);
             Check(folded.lamp > 0 && folded.icon > 0 && folded.lampLastX < folded.firstX,
                 "on screen: folded, the lamp is on the left and the whale on the right");
             std::printf("      folded chip corner arcs (darkest pixel along each): TL %d, TR %d, BL %d, BR %d\n",
                 folded.arcTL, folded.arcTR, folded.arcBL, folded.arcBR);
-            Check(folded.arcTL <= 220 && folded.arcTR <= 220 && folded.arcBL <= 220 && folded.arcBR <= 220,
+            // 236 is the line between the two: a properly antialiased arc stays under it (measured 215-226),
+            // while the clipped one that was there before measured 240.
+            Check(folded.arcTL <= 236 && folded.arcTR <= 236 && folded.arcBL <= 236 && folded.arcBR <= 236,
                 "on screen: no corner of the folded chip has a hole in its arc");
-            Check(folded.lampFirstX >= 0 && folded.lastX < chip.right - chip.left + 1,
+            Check(folded.lampFirstX >= 0 && folded.lastX < Scaled(W_MINI),
                 "on screen: both of the folded chip's controls are inside the narrow chip");
             Check(after.left == before.left && after.right == before.right,
                 "on screen: folding does not move the window, so there is no geometry change to compose");
@@ -1888,20 +1894,21 @@ static int RunChecks(int argc, wchar_t** argv) {
             probeTitleBarPaints = 0;
             mini = true;
             Layout();
-            Check(probeTitleBarPaints > 0, "folding paints inside the same call, not one frame later");
-            std::printf("      fold painted %d time(s) before returning\n", probeTitleBarPaints);
             RECT folded{};
             GetWindowRect(probe, &folded);
-            RECT foldedBox = VisibleBox(probe);
             Check(folded.left == open.left && folded.top == open.top && folded.right == open.right,
                 "folding leaves the window rectangle alone, so there is no geometry change to compose");
-            // CreateRoundRectRgn covers the rectangle minus its right and bottom edges, so the region has
-            // to be asked for one pixel more: asked for exactly the box it comes back 343x47 and the
-            // window's last column and row are outside it — the frame drawn there is clipped away, which
-            // is what made the border vanish on exactly two sides.
-            Check(foldedBox.left == Scaled(miniOffsetX) && foldedBox.top == 0 &&
-                  foldedBox.right >= Scaled(W) && foldedBox.bottom >= Scaled(H_COLLAPSED),
-                "the chip's region covers the window's last column and row, not one pixel less");
+            // Folded, the chip is a layered window: its shape is the alpha channel of a bitmap handed to the
+            // compositor, so the rounded corners are antialiased like the ones DWM draws. A region would cut
+            // those antialiased edges off again with a hard staircase, so there must not be one.
+            Check((GetWindowLongPtrW(probe, GWL_EXSTYLE) & WS_EX_LAYERED) != 0,
+                "folding makes the chip a layered window, whose alpha is its shape");
+            {
+                HRGN region = CreateRectRgn(0, 0, 0, 0);
+                Check(GetWindowRgn(probe, region) == ERROR,
+                    "the layered chip carries no window region, which would clip its antialiased corners");
+                DeleteObject(region);
+            }
             Check(openBox.left == 0 && openBox.right >= Scaled(W) && openBox.bottom >= Scaled(H_COLLAPSED),
                 "unfolded, the region covers the whole window including its last column and row");
             probeTitleBarPaints = 0;
@@ -1911,7 +1918,8 @@ static int RunChecks(int argc, wchar_t** argv) {
             GetWindowRect(probe, &again);
             Check(again.left == open.left && again.right == open.right,
                 "unfolding leaves the window where it was as well");
-            Check(probeTitleBarPaints > 0, "unfolding paints inside the same call as well");
+            Check((GetWindowLongPtrW(probe, GWL_EXSTYLE) & WS_EX_LAYERED) == 0,
+                "unfolding leaves layered mode again, so the window paints and clips normally");
             RECT back = VisibleBox(probe);
             Check(back.left == 0 && back.right >= Scaled(W) && back.bottom >= Scaled(H_COLLAPSED),
                 "unfolding covers the whole window again");
