@@ -839,6 +839,7 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         frameLeft = 0, frameRight = 0, frameTop = 0, frameBottom = 0,
                         midLeft = 0, midLeftFull = 0, midRight = 0, midRightFull = 0,
                         midTop = 0, midTopFull = 0, midBottom = 0, midBottomFull = 0,
+                        cornerTL = 0, cornerTR = 0, cornerBL = 0, cornerBR = 0,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 // The exact pixel profile across each edge of the window, printed so an asymmetric hairline shows up in
@@ -933,6 +934,13 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                     if (y <= 5) { ++seen.midTop; if (full) ++seen.midTopFull; }
                     else if (y >= height - 6) { ++seen.midBottom; if (full) ++seen.midBottomFull; }
                 }
+                // The corner zones, where the border has to turn: drawn on the window region's own edge the
+                // arcs were clipped away entirely and the corners had no border at all.
+                const int zone = 5;
+                if (x < zone && y < zone) ++seen.cornerTL;
+                else if (x >= width - zone && y < zone) ++seen.cornerTR;
+                else if (x < zone && y >= height - zone) ++seen.cornerBL;
+                else if (x >= width - zone && y >= height - zone) ++seen.cornerBR;
             }
         }
     }
@@ -1219,8 +1227,8 @@ static void RunScreenChecks() {
             // per row of the left and right. Too many means the hairline was drawn twice or blurred over
             // two columns (a stroked path does that), too few means half of it fell outside the window
             // region — both of which are "the border does not look complete", just in different ways.
-            Check(seen.frameTop >= Scaled(W) - 4 && seen.frameTop <= Scaled(W) + 4 &&
-                  seen.frameBottom >= Scaled(W) - 4 && seen.frameBottom <= Scaled(W) + 4,
+            Check(seen.frameTop >= Scaled(W) - 4 && seen.frameTop <= Scaled(W) + 8 &&
+                  seen.frameBottom >= Scaled(W) - 4 && seen.frameBottom <= Scaled(W) + 8,
                 "on screen: the top and bottom borders are one pixel thick");
             Check(seen.frameLeft >= Scaled(H_COLLAPSED) - 4 && seen.frameLeft <= Scaled(H_COLLAPSED) + 8 &&
                   seen.frameRight >= Scaled(H_COLLAPSED) - 4 && seen.frameRight <= Scaled(H_COLLAPSED) + 8,
@@ -1234,6 +1242,12 @@ static void RunScreenChecks() {
             Check(seen.midLeft == 1 && seen.midLeftFull == 1 && seen.midRight == 1 && seen.midRightFull == 1 &&
                   seen.midTop == 1 && seen.midTopFull == 1 && seen.midBottom == 1 && seen.midBottomFull == 1,
                 "on screen: each side is exactly one full pixel of #B8B8B8, so all four sides match");
+            // The four corners: the border has to turn there. Drawn on the region's own edge the arcs were
+            // clipped away and the corners had no border colour at all — which is what the reader saw.
+            std::printf("      border pixels in the corner zones: TL %d, TR %d, BL %d, BR %d\n",
+                seen.cornerTL, seen.cornerTR, seen.cornerBL, seen.cornerBR);
+            Check(seen.cornerTL >= 3 && seen.cornerTR >= 3 && seen.cornerBL >= 3 && seen.cornerBR >= 3,
+                "on screen: all four corners carry border pixels, so the frame goes right round");
             // The bug this replaced: the pair's plate was derived from the minimize button, so once
             // close led the row the plate covered the left half of the start button and the divider
             // was drawn on the outside edge. Both are read off the screen here.

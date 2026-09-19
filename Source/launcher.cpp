@@ -2566,15 +2566,35 @@ static void Paint() {
     // a clean pixel, which is what made the border look incomplete on the others.
     g.Flush();
     {
-        int dx = Scaled(chipLeft), dy = 0;
-        int dw = Scaled(chipWidth - 1), dh = Scaled(h - 1);
+        const int r = Scaled((int)cornerRadius);
+        const int x0 = Scaled(chipLeft), y0 = 0, w = Scaled(chipWidth), hgt = Scaled(h);
+        HBRUSH brush = CreateSolidBrush(windowBorderColor);
+        // The four sides sit on the outermost pixels, stopping where the corner arcs take over.
+        RECT top{x0 + r, y0, x0 + w - r, y0 + 1};
+        RECT bottom{x0 + r, y0 + hgt - 1, x0 + w - r, y0 + hgt};
+        RECT left{x0, y0 + r, x0 + 1, y0 + hgt - r};
+        RECT right{x0 + w - 1, y0 + r, x0 + w, y0 + hgt - r};
+        FillRect(memory, &top, brush);
+        FillRect(memory, &bottom, brush);
+        FillRect(memory, &left, brush);
+        FillRect(memory, &right, brush);
+        // The corners are arcs inset by one pixel. Drawing them on the boundary of the window region put
+        // every arc pixel outside the region, where the system clips it, so the four corners came out
+        // with no border at all — only a single stray pixel survived.
         HPEN pen = CreatePen(PS_SOLID, 1, windowBorderColor);
         HGDIOBJ oldPen = SelectObject(memory, pen);
         HGDIOBJ oldBrush = SelectObject(memory, GetStockObject(NULL_BRUSH));
-        RoundRect(memory, dx, dy, dx + dw, dy + dh, Scaled(2 * (int)cornerRadius), Scaled(2 * (int)cornerRadius));
+        const int d = 2 * r;
+        Arc(memory, x0 + 1, y0 + 1, x0 + 1 + d, y0 + 1 + d, x0 + 1 + r, y0 + 1, x0 + 1, y0 + 1 + r);
+        Arc(memory, x0 + w - 1 - d, y0 + 1, x0 + w - 1, y0 + 1 + d, x0 + w - 1, y0 + 1 + r, x0 + w - 1 - r, y0 + 1);
+        Arc(memory, x0 + w - 1 - d, y0 + hgt - 1 - d, x0 + w - 1, y0 + hgt - 1, x0 + w - 1 - r, y0 + hgt - 1,
+            x0 + w - 1, y0 + hgt - 1 - r);
+        Arc(memory, x0 + 1, y0 + hgt - 1 - d, x0 + 1 + d, y0 + hgt - 1, x0 + 1, y0 + hgt - 1 - r,
+            x0 + 1 + r, y0 + hgt - 1);
         SelectObject(memory, oldBrush);
         SelectObject(memory, oldPen);
         DeleteObject(pen);
+        DeleteObject(brush);
     }
     DrawButton(g,LampRect(),L"",Button::Status);
     SolidBrush dot(ColorForStatus());
