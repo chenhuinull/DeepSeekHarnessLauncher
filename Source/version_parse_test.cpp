@@ -835,6 +835,7 @@ static HICON MakeSolidIcon(int size, COLORREF color) {
 struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1,
                         dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1,
                         lampFirstY = -1, lampLastY = -1,
+                        frame = 0, frameFirstX = -1, frameLastX = -1,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
 
 static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int width, int height) {
@@ -873,6 +874,14 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                 if (x > seen.lampLastX) seen.lampLastX = x;
                 if (seen.lampFirstY < 0 || y < seen.lampFirstY) seen.lampFirstY = y;
                 if (y > seen.lampLastY) seen.lampLastY = y;
+            } else if (std::abs((int)GetRValue(pixel) - 184) <= 6 &&
+                       std::abs((int)GetGValue(pixel) - 184) <= 6 &&
+                       std::abs((int)GetBValue(pixel) - 184) <= 6) {
+                // The outermost border, #B8B8B8. A 1.5px antialiased stroke keeps a few pixels of the
+                // colour it was given, and where they are says the frame is drawn around the window.
+                ++seen.frame;
+                if (seen.frameFirstX < 0 || x < seen.frameFirstX) seen.frameFirstX = x;
+                if (x > seen.frameLastX) seen.frameLastX = x;
             }
         }
     }
@@ -1138,6 +1147,11 @@ static void RunScreenChecks() {
             Check(seen.lampLastX - seen.lampFirstX <= seen.lampLastY - seen.lampFirstY + 1 &&
                   seen.lampLastY - seen.lampFirstY <= seen.lampLastX - seen.lampFirstX + 1,
                 "on screen: the lamp dot is as wide as it is tall, so it is still a circle");
+            // The outermost border, read off the screen: #B8B8B8 along both vertical edges of the window.
+            std::printf("      window border pixels: %d, x=%d..%d (window is %d wide)\n",
+                seen.frame, seen.frameFirstX, seen.frameLastX, Scaled(W));
+            Check(seen.frame > 0 && seen.frameFirstX <= 2 && seen.frameLastX >= Scaled(W) - 3,
+                "on screen: the window's outermost border is drawn in #B8B8B8 along both edges");
             // The bug this replaced: the pair's plate was derived from the minimize button, so once
             // close led the row the plate covered the left half of the start button and the divider
             // was drawn on the outside edge. Both are read off the screen here.
@@ -1642,6 +1656,10 @@ static int RunChecks(int argc, wchar_t** argv) {
     Check(lampDotDiameter > 10 && lampDotDiameter <= indicatorWidth - 6,
         "the lamp dot is bigger than it was and still leaves a margin inside the lamp button");
     Check(lampDotDiameter <= buttonHeight - 6, "the lamp dot fits the button's height too");
+    // The outermost border, in the colour the reader asked for (#B8B8B8), used by the painted frame and
+    // by the frame the menus ask DWM for so the two keep matching.
+    Check(windowBorderArgb == 0xFFB8B8B8u && windowBorderColor == RGB(0xB8, 0xB8, 0xB8),
+        "the outermost border is #B8B8B8, in both the painted frame and the menu frame");
 
     // Folding: the window itself neither moves nor resizes any more. That is the point — a geometry
     // change is what made the compositor show the surface it already had at the new shape for a frame,

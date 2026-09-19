@@ -123,6 +123,10 @@ static constexpr UINT_PTR autoRestartTimerId = 1;
 // Shared with the "stopped, update available" lamp: a running service with auto restart armed is
 // purple too, and the two can never be on at once because that one needs a stopped service.
 static constexpr ARGB lampPurpleArgb = 0xFFA855F7;
+// The launcher's outermost border, and the frame the right-click menus ask DWM to draw so they match
+// the window they belong to: #B8B8B8, a neutral grey.
+static constexpr ARGB windowBorderArgb = 0xFFB8B8B8;
+static constexpr COLORREF windowBorderColor = RGB(0xB8, 0xB8, 0xB8);
 // One corner radius for everything the launcher draws round: the buttons, the window-button plate,
 // the menu highlight, the log box and the window frame itself. The frame used to be rounder (6) than
 // the controls (4), which read as two different shapes, and the reader asked for it unified and a
@@ -1997,7 +2001,7 @@ static constexpr UINT_PTR menuCopyCommand = 1, menuClearCommand = 2;
 static void RoundMenuFrame(HWND popup) {
     DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
     DwmSetWindowAttribute(popup, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
-    COLORREF border = RGB(169, 184, 204);
+    COLORREF border = windowBorderColor;
     DwmSetWindowAttribute(popup, DWMWA_BORDER_COLOR, &border, sizeof(border));
     SetWindowPos(popup, nullptr, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
@@ -2559,7 +2563,7 @@ static void Paint() {
     {
         GraphicsPath frame;
         Rounded(frame,chipLeft + 1.f,1.f,chipWidth-2.f,h-2.f,cornerRadius);
-        Pen border(Color(169,184,204),1.5f); g.DrawPath(&border,&frame);
+        Pen border(Color(windowBorderArgb),1.5f); g.DrawPath(&border,&frame);
     }
     DrawButton(g,LampRect(),L"",Button::Status);
     SolidBrush dot(ColorForStatus());
@@ -2886,7 +2890,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if (HWND popup = FindWindowW(L"#32768", nullptr)) {
             DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUNDSMALL;
             DwmSetWindowAttribute(popup, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
-            COLORREF border = RGB(169, 184, 204);
+            COLORREF border = windowBorderColor;
             DwmSetWindowAttribute(popup, DWMWA_BORDER_COLOR, &border, sizeof(border));
         }
         return 0;
