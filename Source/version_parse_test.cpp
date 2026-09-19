@@ -1793,12 +1793,15 @@ static int RunChecks(int argc, wchar_t** argv) {
             RECT foldedBox = VisibleBox(probe);
             Check(folded.left == open.left && folded.top == open.top && folded.right == open.right,
                 "folding leaves the window rectangle alone, so there is no geometry change to compose");
-            // Regions exclude their right and bottom edges, so the box is one short of the size.
-            Check(foldedBox.left == Scaled(miniOffsetX) && foldedBox.right == Scaled(W) - 1 &&
-                  foldedBox.top == 0 && foldedBox.bottom == Scaled(H_COLLAPSED) - 1,
-                "the chip is a region at the window's right edge, of the chip's own width");
-            Check(openBox.left == 0 && openBox.right == Scaled(W) - 1 && openBox.bottom == Scaled(H_COLLAPSED) - 1,
-                "unfolded, the region covers the whole window");
+            // CreateRoundRectRgn covers the rectangle minus its right and bottom edges, so the region has
+            // to be asked for one pixel more: asked for exactly the box it comes back 343x47 and the
+            // window's last column and row are outside it — the frame drawn there is clipped away, which
+            // is what made the border vanish on exactly two sides.
+            Check(foldedBox.left == Scaled(miniOffsetX) && foldedBox.top == 0 &&
+                  foldedBox.right >= Scaled(W) && foldedBox.bottom >= Scaled(H_COLLAPSED),
+                "the chip's region covers the window's last column and row, not one pixel less");
+            Check(openBox.left == 0 && openBox.right >= Scaled(W) && openBox.bottom >= Scaled(H_COLLAPSED),
+                "unfolded, the region covers the whole window including its last column and row");
             probeTitleBarPaints = 0;
             mini = false;
             Layout();
@@ -1808,7 +1811,7 @@ static int RunChecks(int argc, wchar_t** argv) {
                 "unfolding leaves the window where it was as well");
             Check(probeTitleBarPaints > 0, "unfolding paints inside the same call as well");
             RECT back = VisibleBox(probe);
-            Check(back.left == 0 && back.right == Scaled(W) - 1 && back.bottom == Scaled(H_COLLAPSED) - 1,
+            Check(back.left == 0 && back.right >= Scaled(W) && back.bottom >= Scaled(H_COLLAPSED),
                 "unfolding covers the whole window again");
             windowHandle = previousWindow;
             mini = previousMini; expanded = previousExpanded;

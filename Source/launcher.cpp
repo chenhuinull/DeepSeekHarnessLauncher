@@ -2408,9 +2408,11 @@ static void Layout() {
     {
         int left = mini ? Scaled(miniOffsetX) : 0;
         int bottom = mini ? Scaled(H_COLLAPSED) : height;
-        // bRedraw FALSE: the paint below is the one that has to be seen, and the system's own redraw
-        // would use the surface as it still is.
-        SetWindowRgn(windowHandle, CreateRoundRectRgn(left, 0, width, bottom,
+        // One more than the box: CreateRoundRectRgn covers the rectangle minus its right and bottom
+        // edges, so a region asked for 344x48 covers 343x47 and the window's last column and row are not
+        // part of it at all — the frame drawn on them was clipped away, which is why the border was
+        // missing on exactly two sides.
+        SetWindowRgn(windowHandle, CreateRoundRectRgn(left, 0, width + 1, bottom + 1,
             Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
     }
     if (logEdit) {
