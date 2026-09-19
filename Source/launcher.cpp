@@ -2345,6 +2345,18 @@ static void ShowTrayMenu() {
 
 // The tip is rebuilt from the current status name, so a toggle that changes the name (auto restart)
 // can refresh it without inventing a new detail line.
+static void PaintLayeredChip();   // defined with the painting code below
+static void SetLayered(bool layered);
+
+// Anything that changes how the panel looks goes through here. A layered window's WM_PAINT output is never
+// composited — its content is the bitmap the system was handed — so invalidating it would leave the stale
+// picture on screen: folded, the lamp kept the colour it had while the service came and went.
+static void RepaintWindow() {
+    if (!windowHandle) return;
+    if (mini) PaintLayeredChip();
+    else { InvalidateRect(windowHandle, nullptr, FALSE); UpdateWindow(windowHandle); }
+}
+
 static void RefreshStatusTip() {
     std::wstring name = StatusName();
     statusTip = statusDetail.empty() ? name : name + L" · " + statusDetail;
@@ -2356,7 +2368,7 @@ static void SetStatus(State state, const std::wstring& detail) {
     status = state;
     statusDetail = detail;
     RefreshStatusTip();
-    InvalidateRect(windowHandle, nullptr, FALSE);
+    RepaintWindow();
 }
 
 // Backoff for the automatic restarts: 3s, 6s, 12s, ... capped at 30s.
@@ -2381,8 +2393,9 @@ static void ScheduleAutoRestart(const std::wstring& why) {
         autoRestart = false;
         AppendLog(L"自动重启已连续失败 " + std::to_wstring(autoRestartStreak) + L" 次，已自动关闭该功能；"
             L"请查看日志后手动启动。");
+        SaveSettings();          // the file says the feature is off now, not only the running copy
         RefreshStatusTip();
-        InvalidateRect(windowHandle, nullptr, FALSE);
+        RepaintWindow();
         return;
     }
     DWORD delay = AutoRestartDelayMs(autoRestartStreak);
@@ -2406,7 +2419,7 @@ static void ToggleAutoRestart() {
     }
     SaveSettings();
     RefreshStatusTip();
-    InvalidateRect(windowHandle, nullptr, FALSE);
+    RepaintWindow();
 }
 
 static int Scaled(int n) { return (int)(n * scaleFactor + .5f); }
@@ -2428,8 +2441,6 @@ static void ApplySystemFrame() {
 // saw both. Here the silhouette, the border, the lamp and the whale are painted together, so the corners
 // are as smooth as the ones DWM draws for the unfolded window. The window rectangle and the region are
 // left alone, so folding still moves nothing and shows no stale frame.
-static void PaintLayeredChip();   // defined with the painting code below
-static void SetLayered(bool layered);
 static void Layout() {
     if (!windowHandle) return;
     // The width never changes: the folded chip is a region of the same window rectangle, anchored to
@@ -2811,7 +2822,7 @@ static void SetLayered(bool layered) {
 
 static void BeginWork(Work work) {
     if (busy || serverRunning) return;
-    busy = true; InvalidateRect(windowHandle,nullptr,FALSE);
+    busy = true; RepaintWindow();
     std::thread([work]{ Worker(work); }).detach();
 }
 
@@ -2844,7 +2855,7 @@ static void OnClick(Button button) {
         SetWindowPos(windowHandle,topmost ? HWND_TOPMOST : HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);
         AppendLog(topmost ? L"已开启窗口始终置顶。" : L"已关闭窗口始终置顶。");
         SaveSettings();
-        InvalidateRect(windowHandle,nullptr,FALSE); break;
+        RepaintWindow(); break;
     case Button::Minimize:
         AppendLog(L"已最小化到托盘，点击托盘图标可重新打开窗口。");
         HideLauncherWindow();

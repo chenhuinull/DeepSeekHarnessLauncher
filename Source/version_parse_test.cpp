@@ -1370,6 +1370,21 @@ static void RunScreenChecks() {
                 "on screen: no corner of the folded chip has a hole in its arc");
             Check(folded.lampFirstX >= 0 && folded.lastX < Scaled(W_MINI),
                 "on screen: both of the folded chip's controls are inside the narrow chip");
+            // The folded chip is a layered window: its content is the bitmap the system was handed, so a
+            // status change has to be painted again by hand — invalidating it leaves the old lamp on screen,
+            // and the chip would go on showing a colour that no longer describes the service.
+            {
+                Check(folded.lamp > 0, "on screen: the folded chip's lamp shows its state's colour");
+                autoRestart = true;
+                SetStatus(State::Running, L"切换状态以核对芯片重绘");   // the lamp turns purple now
+                Settle(200);
+                TitleBarPixels repainted = ScanTitleBar(bar, chipLeft, 0, Scaled(W_MINI), Scaled(H_COLLAPSED));
+                Check(repainted.lamp == 0,
+                    "on screen: a status change repaints the chip, so the lamp follows the state");
+                autoRestart = false;
+                SetStatus(State::Stopped, L"核对完毕");
+                Settle(150);
+            }
             Check(after.left == before.left && after.right == before.right,
                 "on screen: folding does not move the window, so there is no geometry change to compose");
             Check(whaleAfter == whaleBefore,
@@ -1733,6 +1748,27 @@ static int RunChecks(int argc, wchar_t** argv) {
         Check(menu && (GetMenuState(menu, 2, MF_BYPOSITION) & MF_CHECKED) != 0,
             "the auto restart item is ticked while the feature is on");
         DestroyMenu(menu);
+
+        autoRestart = false;
+        autoRestartStreak = 0;
+        autoRestartReadyAt = 0;
+        fs::path savedRuntime = runtimeDir;
+        fs::path probeRuntime = fs::temp_directory_path() / L"dsh-giveup-check" / L"runtime";
+        fs::remove_all(probeRuntime.parent_path());
+        runtimeDir = probeRuntime;
+        autoRestart = true;
+        autoRestartStreak = maxAutoRestarts;      // the budget is spent
+        SaveSettings();                           // ...and the file currently says the feature is on
+        ScheduleAutoRestart(L"服务意外退出，");
+        Check(!autoRestart, "giving up turns the feature off in the running copy");
+        autoRestart = true;                       // pretend the running copy forgot:
+        LoadSettings();                           // the file has the last word when the launcher starts
+        Check(!autoRestart, "the give-up is written to settings.ini, so a restart does not bring it back");
+        fs::remove_all(probeRuntime.parent_path());
+        runtimeDir = savedRuntime;
+        autoRestart = true;                       // back to what the checks below expect
+        autoRestartStreak = 0;
+        autoRestartReadyAt = 0;
 
         status = State::Running;
         Check(ColorForStatus().GetValue() == 0xFFA855F7u,
