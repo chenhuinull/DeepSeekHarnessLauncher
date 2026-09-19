@@ -208,6 +208,29 @@ static void CheckLogBars() {
     Pump();
     Check(FirstVisibleLine() < beforeWheel, "a wheel notch scrolls the log back up");
 
+    // A precise wheel or a touchpad reports a fraction of a notch. Divided away, 60 was zero and the log
+    // could not be scrolled with the wheel at all on those devices; the remainder has to be held over.
+    beforeWheel = FirstVisibleLine();
+    SendMessageW(logEdit, WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)60), MAKELPARAM(0, 0));
+    Pump();
+    Check(FirstVisibleLine() == beforeWheel, "a third of a notch on its own is not a scroll yet");
+    SendMessageW(logEdit, WM_MOUSEWHEEL, MAKEWPARAM(0, (WORD)60), MAKELPARAM(0, 0));
+    Pump();
+    Check(FirstVisibleLine() < beforeWheel, "but the thirds are kept, so the wheel does move it");
+
+    // The sideways position the reader chose has to survive the output that keeps arriving. Following the
+    // tail means putting the caret on the start of the last line, which drags the view back to the left
+    // edge and used to throw away the right half of the long line they were reading — every five seconds.
+    {
+        int keptBefore = logHorizontalOffset;
+        AppendLog(wide + L" one more");
+        Pump();
+        Check(logHorizontalOffset > 0 && logHorizontalOffset >= keptBefore - LogCharWidth(),
+            "an entry arriving while the log is scrolled sideways keeps the reader's own position");
+        std::printf("      sideways offset %d px before that entry, %d px after\n",
+            keptBefore, logHorizontalOffset);
+    }
+
     // The reader's selection has to survive the output that keeps arriving. The log streams while the
     // service is talking, and appending means moving the caret to the end of the text to insert: that
     // took the selection with it, so "复制" was greyed out by the time the reader got the menu open.
@@ -266,6 +289,48 @@ static void CheckLogBars() {
         Check((int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) == before + 1,
             "the button coming up writes what the drag held back");
         Check(logDeferred.empty(), "and nothing is left waiting after that");
+
+        // One entry is one line even when the text behind it carried its own break or a tab: a CRLF is a
+        // line to the control, so an entry carrying one puts the tracked count, the trim and the
+        // widest-line record out of step with the text they describe.
+        {
+            ClearLog();
+            Pump();
+            for (int line = 0; line < 5; ++line) AppendLog(L"line " + std::to_wstring(line));
+            Pump();
+            int linesBefore = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
+            AppendLog(L"progress 10%\r\nprogress 20%\tdone\r");
+            Pump();
+            int linesNow = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
+            Check(linesNow == linesBefore + 1, "a break and a tab inside an entry do not become extra lines");
+            Check(logLineCount == linesNow, "and the tracked line count is the control's own");
+            wchar_t text[128]{};
+            *reinterpret_cast<WORD*>(text) = 127;
+            int copiedLine = (int)SendMessageW(logEdit, EM_GETLINE, (WPARAM)linesNow - 1, (LPARAM)text);
+            std::wstring stored(text, copiedLine > 0 ? (size_t)copiedLine : 0u);
+            Check(stored.find(L'\r') == std::wstring::npos && stored.find(L'\t') == std::wstring::npos &&
+                  stored.find(L'\n') == std::wstring::npos,
+                "the break and tab characters are flattened on the way in rather than stored");
+        }
+
+        // 全选 then 复制 a while later: a selection that ran to the end of the text is "everything so
+        // far", so it has to grow with each entry instead of stopping at the length it had when the key
+        // was pressed — which is what the copied text would have stopped at.
+        {
+            ClearLog();
+            Pump();
+            for (int line = 0; line < 5; ++line) AppendLog(L"line " + std::to_wstring(line));
+            Pump();
+            SendMessageW(logEdit, EM_SETSEL, 0, (LPARAM)-1);
+            int lengthBefore = GetWindowTextLengthW(logEdit);
+            AppendLog(L"a line that arrived after the reader selected everything");
+            Pump();
+            LONG allFrom = -1, allTo = -1;
+            int lengthNow = GetWindowTextLengthW(logEdit);
+            Check(LogSelectionRange(allFrom, allTo) && allFrom == 0 && allTo == lengthNow &&
+                  lengthNow > lengthBefore,
+                "select-all grows with the entry, so copying it later still holds the whole log");
+        }
     }
 
     ClearLog();
@@ -1389,6 +1454,36 @@ static void RunScreenChecks() {
                 "on screen: folding does not move the window, so there is no geometry change to compose");
             Check(whaleAfter == whaleBefore,
                 "on screen: the whale does not move when the chip folds, which is the point of folding this way");
+
+            // The same fold on a scaled display. The chip's body, its lamp and its whale are laid out in
+            // the launcher's own units while the layered bitmap is built in device pixels; leaving the two
+            // mixed put the white body at the scaled offset and the lamp and the whale unscaled, so both
+            // ended up floating in the transparent area beside the chip. The factor is raised by hand here
+            // because this machine's display is at 100%.
+            {
+                float savedScale = scaleFactor;
+                RECT restore{};
+                GetWindowRect(bar, &restore);
+                scaleFactor = 1.5f;
+                // Slide it left first: at 1.5x the window is half again as wide, and the chip is its right
+                // end, so from where this window sits the chip itself would be off the screen.
+                SetWindowPos(bar, HWND_TOPMOST, work.right - Scaled(W) - 20, restore.top, 0, 0,
+                    SWP_NOSIZE | SWP_NOACTIVATE);
+                Layout();
+                Settle(250);
+                TitleBarPixels scaled = ScanTitleBar(bar, Scaled(miniOffsetX), 0,
+                    Scaled(W_MINI), Scaled(H_COLLAPSED));
+                std::printf("      at 1.5x: chip %d px wide at window x=%d, lamp x=%d..%d, icon x=%d..%d\n",
+                    Scaled(W_MINI), Scaled(miniOffsetX), scaled.lampFirstX, scaled.lampLastX,
+                    scaled.firstX, scaled.lastX);
+                Check(scaled.lamp > 0 && scaled.icon > 0 && scaled.lampLastX < scaled.firstX &&
+                      scaled.firstX < Scaled(W_MINI),
+                    "on screen: at 1.5x the folded chip still carries its lamp and its whale");
+                scaleFactor = savedScale;
+                SetWindowPos(bar, HWND_TOPMOST, restore.left, restore.top, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                Layout();
+                Settle(250);
+            }
             mini = false;
 
             if (appIcon) DestroyIcon(appIcon);
@@ -1615,6 +1710,14 @@ static int RunChecks(int argc, wchar_t** argv) {
     Check(CompareVersions(L"11.13.0", L"11.13") == 0 && CompareVersions(L"12.0.0", L"11.99.99") > 0,
         "version comparison handles missing components");
     Check(MajorOf(L"11.17.0") == 11 && MajorOf(L"12.0.0") == 12 && MajorOf(L"") == 0, "major extraction");
+    // What the update button may offer. A different string is not enough: npm's tag can be older than
+    // what is installed, and lighting the button up for it turned a click into a downgrade.
+    Check(RemoteIsNewer(L"0.1.6", L"0.1.5") && RemoteIsNewer(L"0.2.0", L"0.1.9") &&
+          RemoteIsNewer(L"0.1.5", L"0.1.5-rc.2") && RemoteIsNewer(L"0.1.5-rc.4", L"0.1.5-rc.2"),
+        "a newer release, a newer minor and an rc against its release are all offered as updates");
+    Check(!RemoteIsNewer(L"0.1.5", L"0.1.5") && !RemoteIsNewer(L"0.1.4", L"0.1.5") &&
+          !RemoteIsNewer(L"0.1.5", L"0.2.0"),
+        "the same version and anything older than what is installed are not offered");
     Check(SamePath(L"C:\\A\\b", L"c:\\a\\B") && !SamePath(L"a", L"ab"), "path comparison ignores case");
 
     // npm discovery and selection through the real code paths: three stand-in npm copies
@@ -1769,6 +1872,27 @@ static int RunChecks(int argc, wchar_t** argv) {
         autoRestart = true;                       // back to what the checks below expect
         autoRestartStreak = 0;
         autoRestartReadyAt = 0;
+
+        // The stamp that forgives the streak is spent by the first failure that reads it. Left in place,
+        // every later failure also looked settled: the streak dropped back to one each time, the delay
+        // never grew past three seconds and the give-up above could never fire — the exact endless
+        // restart the backoff exists to prevent.
+        {
+            KillTimer(windowHandle, autoRestartTimerId);
+            autoRestart = true;
+            autoRestartStreak = 0;
+            autoRestartReadyAt = GetTickCount64() - (autoRestartSettledMs + 1000);   // settled, then died
+            ScheduleAutoRestart(L"服务意外退出，");
+            Check(autoRestartStreak == 1 && autoRestartReadyAt == 0,
+                "a settled start forgives the streak once, and the stamp is spent doing it");
+            ScheduleAutoRestart(L"服务意外退出，");
+            Check(autoRestartStreak == 2, "the next failure counts, so the counter climbs instead of resetting");
+            ScheduleAutoRestart(L"服务意外退出，");
+            Check(autoRestartStreak == 3, "and the one after that too, up to the give-up rule");
+            KillTimer(windowHandle, autoRestartTimerId);
+            autoRestartStreak = 0;
+            autoRestartReadyAt = 0;
+        }
 
         status = State::Running;
         Check(ColorForStatus().GetValue() == 0xFFA855F7u,

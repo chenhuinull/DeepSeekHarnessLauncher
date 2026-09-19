@@ -165,12 +165,16 @@ static HANDLE workJob = nullptr, serverJob = nullptr;
 static ServerIdentity serverIdentity;
 static fs::path runtimeDir;
 static constexpr wchar_t serverJobName[] = L"Local\\DeepSeekHarnessLauncher.Server";
-static bool expanded = false, topmost = true, busy = false, serverRunning = false;
+static bool expanded = false, topmost = true, busy = false;
+// Atomic because the thread that owns the service writes these two as soon as it has taken the service
+// over — the window reads them from its own thread to label the button, the tray menu and the paint.
+static std::atomic_bool serverRunning{false};
 static bool autoRestart = false;          // the tray toggle: bring the service back by itself
 static int autoRestartStreak = 0;         // automatic restarts in a row that have not settled yet
 static ULONGLONG autoRestartReadyAt = 0;  // when the running service last became ready
 static bool mini = false;
-static bool stopping = false, updateAvailable = false, serverExternal = false;
+static bool stopping = false, updateAvailable = false;
+static std::atomic_bool serverExternal{false};   // taken over rather than started here, so stopping asks first
 // Whether the system will round the window's corners and draw its border for us. Its corners are
 // antialiased, which a window region's are not, so the unfolded window hands its shape over to DWM and
 // only the folded chip — which has to be cut out of the window — uses a region and a frame of our own.
@@ -178,6 +182,7 @@ static bool systemCorners = false;
 static std::atomic_bool serverReady{false};
 static State status = State::Missing;
 static Button hoverButton = Button::None;
+static Button pressedButton = Button::None;   // the button the mouse is holding down, if any
 static std::wstring statusTip = L"未安装固件", statusDetail, updateLabel = L"更新", rollbackVersion;
 static int logLineCount = 0;
 static bool logHovered = false;         // the pointer is over the log box (or a bar is being dragged)
@@ -186,6 +191,7 @@ static int logMaxLineWidth = 0;         // widest line in the retained log, in p
 static int logMaxLineIndex = -1;        // which line that was, so a trim knows when to rescan
 static int logHorizontalOffset = 0;     // pixels the text is scrolled sideways
 static int logTextOriginX = INT_MIN;    // x of character 0 while the view is not scrolled
+static int logBarGrabOffset = -1;       // where inside the thumb a drag started, -1 when it missed
 // Entries that arrived while the reader was dragging a selection out of the log. Writing an entry
 // means moving the caret to the end of the text, and doing that under the pointer takes the drag's
 // anchor with it, so the selection collapses mid-gesture. The gesture ends when the button comes up.
@@ -512,6 +518,16 @@ static int CompareVersions(const std::wstring& a, const std::wstring& b) {
         if (j < b.size() && b[j] == L'.') ++j;
     }
     return 0;
+}
+
+// Whether the release npm advertises should replace what is installed. A different string is not
+// enough: the installed build can be newer than what the tag npm answers with — an rc put there by
+// hand, or a version installed from a branch — and calling that "发现新版本" with the button lit up
+// walks the reader into a downgrade. Equal numbers still count (an rc against its own release, and
+// the pre-release tags CompareVersions cannot order); a lower number never does.
+static bool RemoteIsNewer(const std::wstring& remote, const std::wstring& installed) {
+    if (remote == installed) return false;
+    return CompareVersions(remote, installed) >= 0;
 }
 
 // Every npm this machine offers: the one paired with the chosen Node.js, the launcher's
@@ -1133,8 +1149,13 @@ static void ReadServerLog(unsigned long long& offset, std::string& pending) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
             PostLog(Utf8(line));
-            if (line.find("dsh web: http") != std::string::npos && !closing && !serverReady)
+            // The flag goes up with the message, not with the handler: the port probe below runs in
+            // this same pass, and reading the ready banner twice — once here and once there — put two
+            // WM_SERVER_READY messages on the queue, and the launcher opened the page twice.
+            if (line.find("dsh web: http") != std::string::npos && !closing && !serverReady) {
+                serverReady = true;
                 PostMessageW(windowHandle, WM_SERVER_READY, 0, 0);
+            }
         }
         if (pending.size() > 65536) { PostLog(Utf8(pending)); pending.clear(); }
     }
@@ -1407,7 +1428,7 @@ static std::wstring ExceptionMessage(const std::exception& e) {
     return L"操作失败：" + Utf8(what);
 }
 
-static void Worker(Work work) {
+static void Worker(Work work, const std::wstring& rollbackTarget) {
     // Never race a live web service: adopt it instead of starting a second one that
     // would only die with EADDRINUSE.
     if (work == Work::Start && AdoptRunningService()) return;
@@ -1439,7 +1460,7 @@ static void Worker(Work work) {
             result->version = QuotedVersion(output);
             if (result->version.empty()) throw std::runtime_error("version missing");
             result->installed = Installed();
-            result->update = result->installed && Version() != result->version;
+            result->update = result->installed && RemoteIsNewer(result->version, Version());
             result->ok = true;
             finish();
             return;
@@ -1472,8 +1493,8 @@ static void Worker(Work work) {
         if (work == Work::InstallUpdate) {
             InstallHarness(tools, L"latest");
         } else {
-            if (rollbackVersion.empty()) throw std::runtime_error("rollback missing");
-            InstallHarness(tools, rollbackVersion);
+            if (rollbackTarget.empty()) throw std::runtime_error("rollback missing");
+            InstallHarness(tools, rollbackTarget);
         }
         result->ok = true; result->installed = true; result->version = Version();
     } catch (const std::exception& e) { result->message = ExceptionMessage(e); }
@@ -1594,8 +1615,11 @@ static void RescanLogLineWidths() {
 }
 
 // Character 0 sits at the text's own left inset when nothing is scrolled and moves left by exactly
-// the offset. The value comes back as a short, so a very large offset is not representable and the
-// tracked one is kept instead.
+// the offset. The value comes back as a short, so a very large offset would not be representable and
+// the tracked one is kept instead — but the control caps its own horizontal scroll range well inside
+// that: measured, a 200k-character line stops at x = -6852 and further EM_LINESCROLL has no effect, so
+// the read is always representable. EM_GETSCROLLPOS and GetScrollInfo(SB_HORZ) are no help — a
+// multiline edit without WS_HSCROLL answers neither.
 static void SyncLogHorizontalOffset() {
     if (!logEdit) return;
     int x = (int)(short)LOWORD(SendMessageW(logEdit, EM_POSFROMCHAR, 0, 0));
@@ -1714,10 +1738,24 @@ static void RefreshLogBars() {
     bool dragging = (logVerticalBar && GetCapture() == logVerticalBar) ||
                     (logHorizontalBar && GetCapture() == logHorizontalBar);
     bool hovered = dragging || LogBoxContainsCursor();
-    if (hovered == logHovered && selected == logSelected) return;
     logHovered = hovered;
     logSelected = selected;
+    // Repainted whether or not the bars just appeared: the keyboard and the caret move the view
+    // without the launcher asking, so a line left at its old place while the text scrolled behind it
+    // is the alternative to redrawing two seven-pixel strips.
     InvalidateLogBars();
+}
+
+// EM_LINESCROLL counts characters, and a Chinese glyph is two cells wide, so a single step can land
+// short of the pixel target: ask again until the offset is close enough. The tracked offset is read
+// back from the control on every step, so what it lands on is what the thumb then reports.
+static void ScrollLogToOffset(int target) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        int step = (target - logHorizontalOffset) / LogCharWidth();
+        if (!step) break;
+        SendMessageW(logEdit, EM_LINESCROLL, step, 0);
+        SyncLogHorizontalOffset();
+    }
 }
 
 // Put the line where the pointer asks for, in the launcher's own units: lines for the vertical bar,
@@ -1730,7 +1768,9 @@ static void DragLogBarTo(HWND cover, int bar, int position) {
     if (!LogBarMetricsFor(bar, vertical ? client.bottom : client.right, metrics)) return;
     int travel = metrics.track - metrics.thumb;
     if (travel <= 0) return;
-    int along = position - metrics.thumb / 2;
+    // A press that landed on the thumb keeps hold of the point it took: pulling the middle of the thumb
+    // onto the pointer first made the content jump by half a thumb before it started following.
+    int along = position - (logBarGrabOffset >= 0 ? logBarGrabOffset : metrics.thumb / 2);
     if (along < 0) along = 0;
     if (along > travel) along = travel;
     int target = (int)((long long)metrics.scrollable * along / travel);
@@ -1738,14 +1778,7 @@ static void DragLogBarTo(HWND cover, int bar, int position) {
         int delta = target - metrics.position;
         if (delta) SendMessageW(logEdit, EM_LINESCROLL, 0, delta);
     } else {
-        // EM_LINESCROLL counts characters, and a Chinese glyph is two cells wide, so a single step
-        // can land short of the pixel target: ask again until the offset is close enough.
-        for (int attempt = 0; attempt < 4; ++attempt) {
-            int step = (target - logHorizontalOffset) / LogCharWidth();
-            if (!step) break;
-            SendMessageW(logEdit, EM_LINESCROLL, step, 0);
-            SyncLogHorizontalOffset();
-        }
+        ScrollLogToOffset(target);
     }
     InvalidateLogBars();
 }
@@ -1780,12 +1813,23 @@ static LRESULT CALLBACK LogBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     // Clicking a bar must not take the caret away from the log, or the keyboard stops scrolling it.
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDOWN: {
         if (logEdit) SetFocus(logEdit);
         SetCapture(hwnd);
-        DragLogBarTo(hwnd, bar, bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp));
+        int position = bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp);
+        // Landing on the line itself holds on to the point that was pressed; a press on the empty track
+        // still brings the line's middle to the pointer.
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        LogBarMetrics metrics;
+        logBarGrabOffset = -1;
+        if (LogBarMetricsFor(bar, bar == SB_VERT ? client.bottom : client.right, metrics) &&
+            position >= metrics.offset && position < metrics.offset + metrics.thumb)
+            logBarGrabOffset = position - metrics.offset;
+        DragLogBarTo(hwnd, bar, position);
         RefreshLogBars();
         return 0;
+    }
     case WM_MOUSEMOVE:
         if (GetCapture() == hwnd) DragLogBarTo(hwnd, bar, bar == SB_VERT ? GET_Y_LPARAM(lp) : GET_X_LPARAM(lp));
         else {
@@ -1799,11 +1843,12 @@ static LRESULT CALLBACK LogBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         return 0;
     case WM_LBUTTONUP:
         if (GetCapture() == hwnd) ReleaseCapture();
+        logBarGrabOffset = -1;
         RefreshLogBars();
         return 0;
     case WM_MOUSEWHEEL:
         // The wheel over a bar is still meant for the log.
-        if (logEdit) { SendMessageW(logEdit, WM_MOUSEWHEEL, wp, lp); InvalidateLogBars(); }
+        if (logEdit) { SendMessageW(logEdit, WM_MOUSEWHEEL, wp, lp); RefreshLogBars(); }
         return 0;
     }
     return DefWindowProcW(hwnd, message, wp, lp);
@@ -1853,7 +1898,16 @@ static std::wstring ComposeLogEntry(const std::wstring& line) {
     // No trailing space after the bracket: this font draws a space half a Chinese glyph wide, which
     // reads as a conspicuous gap between the timestamp and a Chinese message.
     wchar_t stamp[32]; wsprintfW(stamp, L"[%02d:%02d:%02d]", now.wHour, now.wMinute, now.wSecond);
-    std::wstring entry = stamp; entry += line;
+    // One entry is one line, whatever arrived. A break inside the text is a line to the control when it
+    // comes as CRLF, and the line count, the trim and the widest-line record are all line numbers — one
+    // entry that carried a break would put all three out of step with the text. Measured, a lone CR or
+    // LF in the middle is stored but does not break the line; a CR still means nothing on screen and
+    // comes out in a copy as a stray control character, and npm's progress output really does write one.
+    // A tab is flattened for its own reason: the control expands it to the next tab stop, so a line
+    // holding one is wider on screen than the width measured for it, and the horizontal bar could not
+    // reach its end.
+    std::wstring entry = stamp;
+    for (wchar_t c : line) entry += (c == L'\r' || c == L'\n' || c == L'\t') ? L' ' : c;
     return entry;
 }
 
@@ -1864,7 +1918,9 @@ static std::wstring ComposeLogEntry(const std::wstring& line) {
 // put back after it, and the view is not scrolled to the caret in that case: it stays where the
 // reader left it, at the end of their own selection.
 static void WriteLogEntry(const std::wstring& entry) {
-    if (!logEdit) return;
+    // IsWindow as well: losing the capture is also what a control being destroyed reports, and that
+    // path reaches here through FlushDeferredLog with a handle that is on its way out.
+    if (!logEdit || !IsWindow(logEdit)) return;
     // The separator goes in front of the entry, never after it. Ending the text with a newline leaves
     // an empty line at the bottom that the view is pinned to, so the last line of the panel shows
     // nothing but white — the space the reader sees going to waste. This way the newest line is the
@@ -1879,7 +1935,10 @@ static void WriteLogEntry(const std::wstring& entry) {
     int length = GetWindowTextLengthW(logEdit);
     SendMessageW(logEdit, EM_SETSEL, length, length);
     SendMessageW(logEdit, EM_REPLACESEL, FALSE, (LPARAM)appended.c_str());
-    ++logLineCount;
+    // The control's own count, not a running total: the trim below cuts whole lines out by
+    // EM_LINEINDEX and the widest-line record is a line number, so this has to be the number the
+    // control itself indexes lines with.
+    logLineCount = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0);
     // The horizontal bar needs the widest line, in pixels: a Chinese glyph is two cells wide, so a
     // character count would not describe the line's width.
     int width = LogLineWidth(entry);
@@ -1908,6 +1967,10 @@ static void WriteLogEntry(const std::wstring& entry) {
         // Back to the reader's own range, and no EM_SCROLLCARET: the two ends of it are inside what
         // the box is already showing, so the view does not move either.
         LONG from = (LONG)selectedFrom - dropped, to = (LONG)selectedTo - dropped;
+        // A range that ran to the end of the text was "everything so far" rather than a fixed stretch:
+        // it grows with the entry, so Ctrl+A followed by 复制 a while later still holds the whole log
+        // and the highlight does not visibly stop covering the newest lines.
+        if ((LONG)selectedTo == (LONG)length) to = (LONG)length + (LONG)appended.size() - dropped;
         if (from < 0) from = 0;
         if (to < from) to = from;
         SendMessageW(logEdit, EM_SETSEL, from, to);
@@ -1916,8 +1979,17 @@ static void WriteLogEntry(const std::wstring& entry) {
         // bottom without dragging it sideways for long lines.
         int lastLine = (int)SendMessageW(logEdit, EM_GETLINECOUNT, 0, 0) - 1;
         int lastStart = (int)SendMessageW(logEdit, EM_LINEINDEX, (WPARAM)lastLine, 0);
+        int keepOffset = logHorizontalOffset;
         if (lastStart >= 0) SendMessageW(logEdit, EM_SETSEL, lastStart, lastStart);
         SendMessageW(logEdit, EM_SCROLLCARET, 0, 0);
+        // Putting the caret on the start of the line drags the view back to the left edge, and with the
+        // log streaming that happened again with every entry: a reader who had scrolled sideways to the
+        // right half of a long line could never stay there. Their own position is measured again and put
+        // back.
+        if (keepOffset > 0) {
+            SyncLogHorizontalOffset();
+            ScrollLogToOffset(keepOffset);
+        }
     }
     SyncLogHorizontalOffset();
     InvalidateLogBars();
@@ -2149,11 +2221,17 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
     case WM_MOUSEWHEEL: {
         UINT perNotch = 3;
         SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &perNotch, 0);
-        int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+        // The remainder is kept. A precise wheel or a touchpad reports a fraction of a notch — 60, 30,
+        // even 15 — and dividing that by WHEEL_DELTA gives zero: the whole gesture scrolled nothing at
+        // all, and the wheel is the only way to scroll this control.
+        static int wheelRemainder = 0;
+        wheelRemainder += GET_WHEEL_DELTA_WPARAM(wp);
+        int notches = wheelRemainder / WHEEL_DELTA;
+        wheelRemainder -= notches * WHEEL_DELTA;
         int step = perNotch == WHEEL_PAGESCROLL ? VisibleLogLines() : (int)perNotch;
         if (notches && step > 0) {
             SendMessageW(hwnd, EM_LINESCROLL, 0, -notches * step);
-            InvalidateLogBars();
+            RefreshLogBars();   // the wheel moves the view as well as a drag does
         }
         return 0;
     }
@@ -2185,6 +2263,12 @@ static LRESULT CALLBACK LogEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
         // The caret moving can scroll the view sideways without the launcher asking, so the tracked
         // offset is refreshed from the control itself. A click or a key can also change the selection,
         // which is the other thing that brings the bars out.
+        break;
+    case WM_CAPTURECHANGED:
+        // The gesture can end without a button-up ever reaching the control: Alt+Tab, a system prompt,
+        // the panel folding away. The entries it held back are due at that moment, not at whatever
+        // line the service happens to print next.
+        FlushDeferredLog();
         break;
     }
     LRESULT result = DefSubclassProc(hwnd, message, wp, lp);
@@ -2331,7 +2415,11 @@ static void ShowTrayMenu() {
     if (!menu) return;
     POINT cursor{};
     GetCursorPos(&cursor);
-    if (IsWindowVisible(windowHandle)) SetForegroundWindow(windowHandle);
+    // Unconditionally, and before the popup: a notification-icon menu needs its owner to be the
+    // foreground window when it opens, or clicking outside the menu leaves it on screen. The usual way
+    // in is a right click on the tray icon while the window is hidden, which the old test skipped —
+    // exactly the case the rule exists for.
+    SetForegroundWindow(windowHandle);
     RoundOwnedMenuFrameSoon();
     int command = (int)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
         cursor.x, cursor.y, 0, windowHandle, nullptr);
@@ -2345,7 +2433,7 @@ static void ShowTrayMenu() {
 
 // The tip is rebuilt from the current status name, so a toggle that changes the name (auto restart)
 // can refresh it without inventing a new detail line.
-static void PaintLayeredChip();   // defined with the painting code below
+static bool PaintLayeredChip();   // defined with the painting code below
 static void SetLayered(bool layered);
 
 // Anything that changes how the panel looks goes through here. A layered window's WM_PAINT output is never
@@ -2388,7 +2476,11 @@ static bool AutoRestartSettled(ULONGLONG readyAt, ULONGLONG now) {
 // the health probe found it silent) go through the same counter, backoff and give-up rule.
 static void ScheduleAutoRestart(const std::wstring& why) {
     ULONGLONG now = GetTickCount64();
-    if (AutoRestartSettled(autoRestartReadyAt, now)) autoRestartStreak = 0;
+    // The stamp is spent by the check: it describes the start that just died, and leaving it in place
+    // would let the next attempt count as settled too — the streak would drop back to zero on every
+    // failure, so the give-up rule would never fire and the delay would never grow past the first
+    // step. Only a start that has been ready for a whole minute resets the streak, once.
+    if (AutoRestartSettled(autoRestartReadyAt, now)) { autoRestartStreak = 0; autoRestartReadyAt = 0; }
     if (autoRestartStreak >= maxAutoRestarts) {
         autoRestart = false;
         AppendLog(L"自动重启已连续失败 " + std::to_wstring(autoRestartStreak) + L" 次，已自动关闭该功能；"
@@ -2462,15 +2554,19 @@ static void Layout() {
             // and the chip's box in the unfolded window already holds the lamp, the whale and white, which
             // is what the chip looks like — and only then is the antialiased version handed over. Either the
             // whole switch lands inside one frame, or the frame in between shows the same picture.
-            SetWindowRgn(windowHandle, CreateRoundRectRgn(Scaled(miniOffsetX), 0, width + 1,
-                Scaled(H_COLLAPSED) + 1, Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+            // CreateRoundRectRgn returns null when GDI is out of handles, and SetWindowRgn takes that
+            // null as "no region at all": the whole 338px window would be left unclipped instead of
+            // failing loudly. Only hand over a region that was really made.
+            if (HRGN chip = CreateRoundRectRgn(Scaled(miniOffsetX), 0, width + 1,
+                    Scaled(H_COLLAPSED) + 1, Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)))
+                SetWindowRgn(windowHandle, chip, FALSE);
             InvalidateRect(windowHandle, nullptr, FALSE);
             UpdateWindow(windowHandle);
             SetLayered(true);
-            PaintLayeredChip();
-            // And the region goes: the alpha channel is the shape now, and the region's own corner (a wider
-            // radius than the chip's) would otherwise clip the antialiased corners away again.
-            SetWindowRgn(windowHandle, nullptr, FALSE);
+            // The region is what the window is clipped to until the alpha surface has really landed.
+            // Once it has, the region goes: the alpha channel is the shape now, and the region's own
+            // corner (a wider radius than the chip's) would clip the antialiased corners away again.
+            if (PaintLayeredChip()) SetWindowRgn(windowHandle, nullptr, FALSE);
         } else {
             // The other way round: dropping layered mode leaves the surface that is already there — the chip —
             // on screen for a frame, which is what the window looks like anyway, and the normal paint below
@@ -2478,9 +2574,9 @@ static void Layout() {
             SetLayered(false);
             if (systemCorners) {
                 SetWindowRgn(windowHandle, nullptr, FALSE);
-            } else {
-                SetWindowRgn(windowHandle, CreateRoundRectRgn(0, 0, width + 1, height + 1,
-                    Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)), FALSE);
+            } else if (HRGN whole = CreateRoundRectRgn(0, 0, width + 1, height + 1,
+                    Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx))) {
+                SetWindowRgn(windowHandle, whole, FALSE);
             }
         }
     }
@@ -2510,7 +2606,10 @@ static void Layout() {
     }
 }
 
-static void ExpandLog(bool value) { if (expanded == value) return; expanded = value; Layout(); }
+// Folded, the chip has no log panel: a request to show it has to be dropped, not remembered. Left to
+// set the flag, a start failure or a service exit behind the chip's back would unfold the whole panel
+// the next time the whale was double-clicked, with no click having asked for it.
+static void ExpandLog(bool value) { if (mini || expanded == value) return; expanded = value; Layout(); }
 static void ToggleMini() {
     mini = !mini;
     // One Layout, not two: setting expanded directly skips the extra full repaint that going through
@@ -2741,8 +2840,8 @@ static void Paint() {
     SelectObject(memory,old); DeleteObject(bitmap); DeleteDC(memory); EndPaint(windowHandle,&ps);
 }
 
-static void PaintLayeredChip() {
-    if (!windowHandle) return;
+static bool PaintLayeredChip() {
+    if (!windowHandle) return false;
     const int width = Scaled(W), height = Scaled(H_COLLAPSED);
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
@@ -2759,7 +2858,7 @@ static void PaintLayeredChip() {
     HDC screen = GetDC(nullptr);
     HBITMAP dib = CreateDIBSection(screen, (BITMAPINFO*)&header, DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (!dib || !bits) { if (dib) DeleteObject(dib); return; }
+    if (!dib || !bits) { if (dib) DeleteObject(dib); return false; }
     memset(bits, 0, (size_t)width * height * 4);          // nothing of the window is opaque to begin with
     {
         // GDI+ writes proper alpha into those bits when the bitmap wraps them, which a compatible DC would
@@ -2768,8 +2867,13 @@ static void PaintLayeredChip() {
         Gdiplus::Graphics g(&canvas);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
-        const float left = (float)Scaled(miniOffsetX), top = 0.f;
-        const float chipW = (float)Scaled(W_MINI), chipH = (float)height;
+        // Same transform the unfolded paint uses: the chip's box, the lamp and the whale are all laid
+        // out in the launcher's own units. Without it the white body was put down in device pixels
+        // while the lamp and the whale went down unscaled, so on a scaled display the chip was drawn
+        // 1.5x too far right and the two glyphs floated beside it instead of on it.
+        g.ScaleTransform(scaleFactor, scaleFactor);
+        const float left = (float)miniOffsetX, top = 0.f;
+        const float chipW = (float)W_MINI, chipH = (float)H_COLLAPSED;
         // The white inside is filled first, then the border is stroked on top with a 1px pen. Measured, GDI+
         // renders a stroked path half a pixel to the right of its coordinates here, so the path is put on
         // whole pixels and the stroke lands exactly on one column (or row) of the grid — filling two rounded
@@ -2795,17 +2899,31 @@ static void PaintLayeredChip() {
             }
         }
     }
+    bool applied = false;
     HDC memory = CreateCompatibleDC(nullptr);
     if (memory) {
         HGDIOBJ previous = SelectObject(memory, dib);
         SIZE size{width, height};
         POINT source{0, 0};
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        UpdateLayeredWindow(windowHandle, nullptr, nullptr, &size, memory, &source, 0, &blend, ULW_ALPHA);
+        applied = UpdateLayeredWindow(windowHandle, nullptr, nullptr, &size, memory, &source, 0, &blend, ULW_ALPHA) != FALSE;
         SelectObject(memory, previous);
         DeleteDC(memory);
     }
     DeleteObject(dib);
+    if (!applied) {
+        // The surface could not be handed over (GDI or the compositor refused it). A layered window with
+        // nothing in it is an invisible launcher, so fall back to the shape the fold path had already
+        // cut: the window keeps a region on the chip's box and paints through it the ordinary way. The
+        // antialiased corners are lost, the chip is not.
+        SetLayered(false);
+        if (HRGN chip = CreateRoundRectRgn(Scaled(miniOffsetX), 0, Scaled(W) + 1, Scaled(H_COLLAPSED) + 1,
+                Scaled(windowCornerEllipsePx), Scaled(windowCornerEllipsePx)))
+            SetWindowRgn(windowHandle, chip, FALSE);
+        InvalidateRect(windowHandle, nullptr, FALSE);
+        UpdateWindow(windowHandle);
+    }
+    return applied;
 }
 
 // The folded chip is a layered window: its shape comes from the bitmap's alpha channel, so it must not also
@@ -2823,7 +2941,11 @@ static void SetLayered(bool layered) {
 static void BeginWork(Work work) {
     if (busy || serverRunning) return;
     busy = true; RepaintWindow();
-    std::thread([work]{ Worker(work); }).detach();
+    // The fallback version is copied here, on the UI thread. It is a std::wstring the panel reassigns
+    // from the exit handler and from every finished job, so a worker that read the global could be
+    // reading the old buffer of a string that was just reallocated underneath it.
+    std::wstring rollbackTarget = work == Work::Rollback ? rollbackVersion : std::wstring();
+    std::thread([work, rollbackTarget]{ Worker(work, rollbackTarget); }).detach();
 }
 
 static void OnClick(Button button) {
@@ -2843,7 +2965,13 @@ static void OnClick(Button button) {
             stopping = true; busy = true;
             if (TerminateServer(id)) SetStatus(State::Stopped,L"正在关闭 Web 服务…");
             else { busy = false; stopping = false; AppendLog(L"停止失败：无法结束 Web 服务进程。"); }
-        } else { serverReady = false; autoRestartStreak = 0; autoRestartReadyAt = 0; BeginWork(Work::Start); }
+        } else {
+            // A manual start takes over from a scheduled retry: leaving the timer armed would let it
+            // fire after this attempt has already failed, starting a second one that the streak and the
+            // backoff know nothing about.
+            KillTimer(windowHandle, autoRestartTimerId);
+            serverReady = false; autoRestartStreak = 0; autoRestartReadyAt = 0; BeginWork(Work::Start);
+        }
         break;
     case Button::Update:
         if (busy || serverRunning) break;
@@ -2970,9 +3098,26 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     }
     case WM_LBUTTONDOWN: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
-        OnClick(Hit(x,y));   // dragging is handled through WM_NCHITTEST/HTCAPTION
+        // The press only remembers which button it is on; the action follows the release, so dragging off
+        // a button before letting go cancels it the way it does everywhere else. Moving the window is not
+        // affected: that is HTCAPTION, which the system takes over straight from WM_NCHITTEST.
+        pressedButton = Hit(x,y);
+        if (pressedButton != Button::None) SetCapture(hwnd);
         return 0;
     }
+    case WM_LBUTTONUP: {
+        Button was = pressedButton;
+        pressedButton = Button::None;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (was == Button::None) return 0;
+        int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
+        // Same button under the pointer at the end: the press meant it. Anywhere else: it did not.
+        if (Hit(x,y) == was) OnClick(was);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        pressedButton = Button::None;   // the gesture was taken over by something else: it is over
+        return 0;
     case WM_LBUTTONDBLCLK: {
         int x=(int)(GET_X_LPARAM(lp)/scaleFactor), y=(int)(GET_Y_LPARAM(lp)/scaleFactor);
         if(IconRect().contains(x,y)) ToggleMini();
@@ -3083,7 +3228,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
     case WM_TIMER:
         if (wp == autoRestartTimerId) {
             KillTimer(hwnd,autoRestartTimerId);
-            if (autoRestart&&!closing&&!serverRunning) {
+            // A job already in flight owns the start: announcing a restart that BeginWork would then
+            // refuse to make would leave the log describing something that never happened.
+            if (autoRestart&&!closing&&!serverRunning&&!busy) {
                 AppendLog(L"自动重启：正在重新启动 Web 服务…");
                 serverReady=false; BeginWork(Work::Start);
             }
