@@ -690,6 +690,10 @@ static int RunFoldProbe() {
         frame.width = now.right - now.left;
         frame.left = now.left;
         int winHeight = now.bottom - now.top;      // only what the window covers: the rest is the desktop
+        // Folded, this window is only the chip's box: the rest of its rectangle is the desktop showing through,
+        // and counting dark pixels there would report the wallpaper or the page behind it as a fault.
+        bool folded = (GetWindowLongPtrW(target, GWL_EXSTYLE) & WS_EX_LAYERED) != 0;
+        int coverFrom = folded ? frame.width - Scaled(W_MINI) : 0;
         BitBlt(memory, 0, 0, width, height, screen, box.left, box.top, SRCCOPY);
         BITMAPINFO info{};
         info.bmiHeader.biSize = sizeof(info.bmiHeader);
@@ -707,7 +711,7 @@ static int RunFoldProbe() {
                 // Near-black inside the window. The launcher's own colours are all light or coloured (text is
                 // #23324E, the border #B8B8B8), so black here is the window's own DC showing through unpainted
                 // — which is what the unfold area flashed before the repaint landed.
-                if (y < winHeight && r < 40 && g < 40 && b < 40) ++frame.dark;
+                if (y < winHeight && x >= coverFrom && r < 40 && g < 40 && b < 40) ++frame.dark;
                 // The whale is the only strongly blue thing in the window, so counting it says whether the
                 // chip is on screen at all — a frame with none of it is a frame with no window.
                 if (b > 150 && r < 120 && g < 140) ++frame.whale;
