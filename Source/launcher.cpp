@@ -59,22 +59,23 @@ static const wchar_t* const logFontFallback = L"Consolas";
 static constexpr int buttonWidth = 46, buttonHeight = 28, buttonTop = 10, buttonGap = 4;
 // The status control is a lamp only, so it stays as narrow as a square indicator.
 static constexpr int indicatorWidth = 28;
-// The title bar reads [minimize][close] then the buttons, and the whale closes the row: the reader
-// asked for the whale and the two window buttons to trade places, so the buttons that used to sit
-// next to the whale at the far left now lead the chip, and the whale takes their old slot.
+// The title bar reads [close][minimize], then the launcher's own buttons, and ends with the lamp
+// sitting next to the whale. The reader asked for all three moves: the window buttons and the whale
+// traded places, then close and minimize swapped with each other, and the lamp came over to the whale.
 static constexpr int leftMargin = 10, rightMargin = 14;
 static constexpr int titleButtonWidth = 25, titleClusterGap = 8;
-static constexpr int minX = leftMargin;
-static constexpr int closeX = minX + titleButtonWidth;
-static constexpr int firstButtonX = closeX + titleButtonWidth + titleClusterGap;
-static constexpr int statusX = firstButtonX;
-static constexpr int startX = statusX + indicatorWidth + buttonGap;
+static constexpr int closeX = leftMargin;                 // close leads the row, minimize follows it
+static constexpr int minX = closeX + titleButtonWidth;
+static constexpr int firstButtonX = minX + titleButtonWidth + titleClusterGap;
+static constexpr int startX = firstButtonX;
 static constexpr int logX = startX + buttonWidth + buttonGap;
 static constexpr int updateX = logX + buttonWidth + buttonGap;
 static constexpr int topmostX = updateX + buttonWidth + buttonGap;
 static constexpr int lastButtonRight = topmostX + buttonWidth;
+// The lamp comes after the buttons and right before the whale, which closes the row.
+static constexpr int statusX = lastButtonRight + titleClusterGap;
 static constexpr int iconTop = 8, iconWidth = 26, iconHeight = 32;
-static constexpr int iconX = lastButtonRight + titleClusterGap;
+static constexpr int iconX = statusX + indicatorWidth + buttonGap;
 static constexpr int W = iconX + iconWidth + rightMargin;
 // Inside the painted border the text box takes everything except the bar zone, so the text gets the
 // space a system scroll bar strip would have taken.
@@ -85,10 +86,10 @@ static constexpr int logEditHeight = logBoxBottomPx - logBarZone - logTop;
 // without it the window's painting is not clipped away from the log box and its bars, and any erase
 // path that is not BeginPaint (which clips by itself) can touch them.
 static constexpr DWORD mainWindowStyle = WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-// Folded down to the whale icon and the status lamp; the rest of the chip drags. The folded chip has
-// no window buttons to swap with, so it keeps the layout and the width it always had.
-static constexpr int miniIconX = leftMargin, miniGap = 6, miniLampX = miniIconX + iconWidth + miniGap;
-static constexpr int W_MINI = miniLampX + indicatorWidth + rightMargin;
+// Folded down to the lamp and the whale; the rest of the chip drags. Folded, the lamp is on the left
+// and the whale on the right, which is the order the reader asked for in the narrow chip.
+static constexpr int miniLampX = leftMargin, miniIconX = miniLampX + indicatorWidth + buttonGap;
+static constexpr int W_MINI = miniIconX + iconWidth + rightMargin;
 static constexpr USHORT serverPort = 3080;
 static constexpr int maxLogLines = 50'000;
 static constexpr int trimChunk = 500;
@@ -2386,7 +2387,7 @@ static void Layout() {
     // The lamp moves when the chip folds, so the tooltip's hot spot has to move with it.
     if (tooltip) {
         UiRect lamp = LampRect();
-        tipInfo.rect = {Scaled(lamp.x), Scaled(buttonTop), Scaled(lamp.x + buttonWidth), Scaled(buttonTop + buttonHeight)};
+        tipInfo.rect = {Scaled(lamp.x), Scaled(buttonTop), Scaled(lamp.x + indicatorWidth), Scaled(buttonTop + buttonHeight)};
         SendMessageW(tooltip, TTM_NEWTOOLRECTW, 0, (LPARAM)&tipInfo);
     }
     InvalidateRect(windowHandle, nullptr, TRUE);
@@ -2662,7 +2663,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         tipInfo.cbSize=sizeof(tipInfo); tipInfo.uFlags=TTF_SUBCLASS; tipInfo.hwnd=hwnd;
         tipInfo.uId=1;
         { UiRect lamp = LampRect();
-          tipInfo.rect={Scaled(lamp.x),Scaled(buttonTop),Scaled(lamp.x + buttonWidth),Scaled(buttonTop + buttonHeight)}; }
+          // Only as wide as the lamp itself: it now sits beside the whale, and a wider hot spot would
+          // steal the whale's own hover.
+          tipInfo.rect={Scaled(lamp.x),Scaled(buttonTop),Scaled(lamp.x + indicatorWidth),Scaled(buttonTop + buttonHeight)}; }
         tipInfo.lpszText=statusTip.data(); SendMessageW(tooltip,TTM_ADDTOOLW,0,(LPARAM)&tipInfo);
         Layout();
         bool attached = AttachRunningServer() || AdoptRunningService();

@@ -636,7 +636,8 @@ static HICON MakeSolidIcon(int size, COLORREF color) {
     return icon;
 }
 
-struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1; };
+struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX = -1,
+                        dash = 0, dashFirstX = -1, lamp = 0, lampFirstX = -1, lampLastX = -1; };
 
 static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
     TitleBarPixels seen;
@@ -661,6 +662,17 @@ static TitleBarPixels ScanTitleBar(HWND window, int width, int height) {
                        std::abs((int)GetBValue(pixel) - 28) <= 40) {
                 ++seen.red;                       // the close button's cross is the only red up here
                 if (x > seen.redLastX) seen.redLastX = x;
+            } else if (std::abs((int)GetRValue(pixel) - 71) <= 20 &&
+                       std::abs((int)GetGValue(pixel) - 85) <= 20 &&
+                       std::abs((int)GetBValue(pixel) - 105) <= 20) {
+                ++seen.dash;                      // the minimize glyph, a lone dark bar
+                if (seen.dashFirstX < 0 || x < seen.dashFirstX) seen.dashFirstX = x;
+            } else if (std::abs((int)GetRValue(pixel) - 234) <= 25 &&
+                       std::abs((int)GetGValue(pixel) - 179) <= 30 &&
+                       std::abs((int)GetBValue(pixel) - 8) <= 40) {
+                ++seen.lamp;                      // the "not started" lamp, the one colour nothing else uses
+                if (seen.lampFirstX < 0 || x < seen.lampFirstX) seen.lampFirstX = x;
+                if (x > seen.lampLastX) seen.lampLastX = x;
             }
         }
     }
@@ -879,15 +891,36 @@ static void RunScreenChecks() {
             Settle(200);
             TitleBarPixels seen = ScanTitleBar(bar, Scaled(W), Scaled(H_COLLAPSED));
             UiRect draw = IconDrawRect();
-            std::printf("      title bar %d px wide: icon at x=%d..%d (%d px, rect %d..%d), close cross ends at x=%d\n",
+            std::printf("      title bar %d px wide: icon at x=%d..%d (%d px, rect %d..%d), close cross x=%d, "
+                "minimize dash x=%d, lamp x=%d..%d\n",
                 Scaled(W), seen.firstX, seen.lastX, seen.icon, Scaled(draw.x),
-                Scaled(draw.x + draw.w), seen.redLastX);
+                Scaled(draw.x + draw.w), seen.redLastX, seen.dashFirstX, seen.lampFirstX, seen.lampLastX);
             Check(seen.icon > 200, "on screen: the whale really is drawn in the title bar");
             Check(seen.firstX >= Scaled(draw.x) - 2 && seen.lastX <= Scaled(draw.x + draw.w) + 2,
                 "on screen: the whale is drawn where its rect is, not at the spot it used to occupy");
-            Check(seen.firstX > Scaled(W) / 2, "on screen: the whale sits in the right half of the title bar");
+            Check(seen.firstX > Scaled(W) / 2, "on screen: the whale sits at the right end of the title bar");
             Check(seen.red > 0 && seen.redLastX < Scaled(W) / 2,
-                "on screen: the minimize and close buttons sit in the left half, so the two did trade places");
+                "on screen: the close button sits in the left half of the title bar");
+            Check(seen.dash > 0 && seen.dashFirstX > seen.redLastX,
+                "on screen: the cross is left of the minimize dash, so the two did swap");
+            Check(seen.lamp > 0 && seen.lampFirstX > Scaled(W) / 2 && seen.lampLastX < seen.firstX &&
+                  seen.firstX - seen.lampLastX <= Scaled(indicatorWidth),
+                "on screen: the lamp is drawn right beside the whale, both at the right end");
+
+            // Folded, the same two controls change places: lamp on the left, whale on the right.
+            SetWindowPos(bar, nullptr, 0, 0, Scaled(W_MINI), Scaled(H_COLLAPSED), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            mini = true;
+            InvalidateRect(bar, nullptr, TRUE);
+            UpdateWindow(bar);
+            Settle(200);
+            TitleBarPixels folded = ScanTitleBar(bar, Scaled(W_MINI), Scaled(H_COLLAPSED));
+            std::printf("      folded chip %d px wide: lamp x=%d..%d, icon x=%d..%d\n",
+                Scaled(W_MINI), folded.lampFirstX, folded.lampLastX, folded.firstX, folded.lastX);
+            Check(folded.lamp > 0 && folded.icon > 0 && folded.lampLastX < folded.firstX,
+                "on screen: folded, the lamp is on the left and the whale on the right");
+            Check(folded.lampFirstX >= 0 && folded.lastX < Scaled(W_MINI),
+                "on screen: both of the folded chip's controls are inside the narrow chip");
+            mini = false;
 
             if (appIcon) DestroyIcon(appIcon);
             appIcon = previousIcon;
@@ -1298,23 +1331,28 @@ static int RunChecks(int argc, wchar_t** argv) {
         topmost = true; autoRestart = false;
     }
 
-    // The title bar, after the reader asked for the whale and the two window buttons to trade
-    // places: the window buttons lead, the launcher's own buttons follow, and the whale closes the
-    // row. The icon is drawn from a rect, so that rect is checked to be inside its slot too.
+    // The title bar, after the reader asked for three moves: the window buttons and the whale traded
+    // places, close and minimize swapped with each other, and the lamp came over to sit by the whale.
     {
-        Check(minRect.x < firstButtonX && closeRect.x + closeRect.w <= firstButtonX,
-            "the minimize and close buttons now lead the title bar");
+        Check(closeRect.x < minRect.x && minRect.x + minRect.w <= firstButtonX,
+            "close and minimize lead the title bar now, close first");
         Check(iconRect.x >= lastButtonRight && iconRect.x + iconRect.w <= W,
-            "the whale closes the title bar now, instead of opening it");
+            "the whale closes the title bar, at the far right");
+        Check(statusX == lastButtonRight + titleClusterGap &&
+              iconRect.x == statusX + indicatorWidth + buttonGap,
+            "the lamp moved to the end of the row, right beside the whale");
+        Check(statusX >= lastButtonRight && statusX + indicatorWidth <= iconRect.x,
+            "the lamp and the whale both sit past the last button, and do not overlap");
         Check(minRect.x + 2 * titleButtonWidth <= iconRect.x,
             "the window buttons and the whale stay at opposite ends, with the buttons between them");
         UiRect draw = IconDrawRect();
         Check(draw.x >= iconRect.x && draw.x + draw.w <= iconRect.x + iconRect.w &&
               draw.y >= iconRect.y && draw.y + draw.h <= iconRect.y + iconRect.h,
             "the icon is drawn inside its slot, so the drawing follows the rect that moved");
-        Check(miniIconRect.x == 10 && miniLampRect.x == 42 && W_MINI == 84,
-            "the folded chip keeps the whale and the lamp where they always were");
-        Check(miniLampRect.x + miniLampRect.w <= W_MINI && miniIconRect.x + miniIconRect.w <= W_MINI,
+        Check(miniLampX == 10 && miniIconX == 42 && miniLampX < miniIconX,
+            "folded, the lamp is on the left and the whale on the right");
+        Check(W_MINI == 82 && miniLampRect.x + miniLampRect.w <= W_MINI &&
+              miniIconRect.x + miniIconRect.w <= W_MINI,
             "both of the folded chip's controls still fit inside it");
         Check(!mini && LampRect().x == statusRect.x && IconRect().x == iconRect.x &&
               (mini = true, LampRect().x == miniLampRect.x && IconRect().x == miniIconRect.x),
