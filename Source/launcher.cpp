@@ -2560,15 +2560,21 @@ static void Paint() {
     int chipWidth = mini ? W_MINI : W;
     int h = mini ? H_COLLAPSED : (expanded ? H_EXPANDED : H_COLLAPSED);
     SolidBrush white(Color::White); g.FillRectangle(&white, 0, 0, W, H_EXPANDED);
+    // The frame is drawn with GDI instead of GDI+: RoundRect on whole pixels puts exactly one pixel of
+    // the colour on each side, with no antialiasing at all. A GDI+ stroke straddles its path, so at 1px
+    // it left half a pixel in one column and half in the next — and only one of the four sides came out
+    // a clean pixel, which is what made the border look incomplete on the others.
+    g.Flush();
     {
-        // The stroke is centred on its path, so the path has to sit half a pen width inside the region
-        // on every side. At 1px the right and bottom halves of the stroke fell outside the region and
-        // were clipped away, which read as a border that is missing on two sides.
-        constexpr float frameInset = 1.5f;
-        GraphicsPath frame;
-        Rounded(frame, chipLeft + frameInset, frameInset,
-            chipWidth - 2 * frameInset, h - 2 * frameInset, cornerRadius);
-        Pen border(Color(windowBorderArgb),1.5f); g.DrawPath(&border,&frame);
+        int dx = Scaled(chipLeft), dy = 0;
+        int dw = Scaled(chipWidth - 1), dh = Scaled(h - 1);
+        HPEN pen = CreatePen(PS_SOLID, 1, windowBorderColor);
+        HGDIOBJ oldPen = SelectObject(memory, pen);
+        HGDIOBJ oldBrush = SelectObject(memory, GetStockObject(NULL_BRUSH));
+        RoundRect(memory, dx, dy, dx + dw, dy + dh, Scaled(2 * (int)cornerRadius), Scaled(2 * (int)cornerRadius));
+        SelectObject(memory, oldBrush);
+        SelectObject(memory, oldPen);
+        DeleteObject(pen);
     }
     DrawButton(g,LampRect(),L"",Button::Status);
     SolidBrush dot(ColorForStatus());
@@ -2707,7 +2713,11 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         windowHandle = hwnd;
         // No DWM corner preference for the launcher itself: its shape is a window region now, because
         // that is what folding uses, and the region and the frame painted inside it have to agree.
-        // (The right-click menus still ask DWM for their corners.)
+        // (The right-click menus still ask DWM for their corners.) DWM's own border is turned off as
+        // well: it drew a dark hairline just outside the frame on two sides, which read as a second,
+        // uneven border around the one this launcher draws itself.
+        COLORREF noBorder = (COLORREF)DWMWA_COLOR_NONE;
+        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &noBorder, sizeof(noBorder));
         appIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
         SendMessageW(hwnd,WM_SETICON,ICON_SMALL,(LPARAM)appIcon);
         logEdit = nullptr;

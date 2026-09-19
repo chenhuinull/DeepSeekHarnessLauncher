@@ -837,7 +837,39 @@ struct TitleBarPixels { int icon = 0, firstX = -1, lastX = -1, red = 0, redLastX
                         lampFirstY = -1, lampLastY = -1,
                         frame = 0, frameFirstX = -1, frameLastX = -1,
                         frameLeft = 0, frameRight = 0, frameTop = 0, frameBottom = 0,
+                        midLeft = 0, midLeftFull = 0, midRight = 0, midRightFull = 0,
+                        midTop = 0, midTopFull = 0, midBottom = 0, midBottomFull = 0,
                         plate = 0, plateFirstX = -1, plateLastX = -1; };
+
+// The exact pixel profile across each edge of the window, printed so an asymmetric hairline shows up in
+// the output and not only as a failed check ("." marks a pixel that is not neutral grey).
+static void PrintBorderProfile(HWND window, int width, int height) {
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    RECT box{};
+    GetWindowRect(window, &box);
+    BitBlt(memory, 0, 0, width, height, screen, box.left, box.top, SRCCOPY);
+    auto show = [&](const char* what, int fixed, bool horizontal, int from, int to) {
+        std::string line;
+        for (int i = from; i < to; ++i) {
+            COLORREF pixel = horizontal ? GetPixel(memory, i, fixed) : GetPixel(memory, fixed, i);
+            int r = GetRValue(pixel), g = GetGValue(pixel), b = GetBValue(pixel);
+            line += (r == g && g == b) ? std::to_string(r) : std::string(".");
+            line += ' ';
+        }
+        std::printf("      %-7s %s\n", what, line.c_str());
+    };
+    show("left", height / 2, false, 0, 6);
+    show("right", height / 2, false, width - 6, width);
+    show("top", width / 2, true, 0, 6);
+    show("bottom", width / 2, true, height - 6, height);
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+}
 
 static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int width, int height) {
     TitleBarPixels seen;
@@ -890,6 +922,17 @@ static TitleBarPixels ScanTitleBar(HWND window, int originX, int originY, int wi
                 else if (x >= width - 5) ++seen.frameRight;
                 if (y <= 4) ++seen.frameTop;
                 else if (y >= height - 5) ++seen.frameBottom;
+                // Along the middle line only: how many pixels of the border each side shows there, and how
+                // many of them are the full colour rather than a partly covered neighbour.
+                bool full = std::abs((int)GetRValue(pixel) - 184) <= 8;
+                if (y == height / 2) {
+                    if (x <= 5) { ++seen.midLeft; if (full) ++seen.midLeftFull; }
+                    else if (x >= width - 6) { ++seen.midRight; if (full) ++seen.midRightFull; }
+                }
+                if (x == width / 2) {
+                    if (y <= 5) { ++seen.midTop; if (full) ++seen.midTopFull; }
+                    else if (y >= height - 6) { ++seen.midBottom; if (full) ++seen.midBottomFull; }
+                }
             }
         }
     }
@@ -1160,6 +1203,7 @@ static void RunScreenChecks() {
                 seen.frame, seen.frameFirstX, seen.frameLastX, Scaled(W));
             std::printf("      border per side: left %d, right %d, top %d, bottom %d\n",
                 seen.frameLeft, seen.frameRight, seen.frameTop, seen.frameBottom);
+            PrintBorderProfile(bar, Scaled(W), Scaled(H_COLLAPSED));
             Check(seen.frame > 0 && seen.frameFirstX <= 2 && seen.frameLastX >= Scaled(W) - 3,
                 "on screen: the window's outermost border is drawn in #B8B8B8 along both edges");
             Check(seen.frameLeft > 0 && seen.frameTop > 0 && seen.frameBottom > 0,
@@ -1171,10 +1215,25 @@ static void RunScreenChecks() {
             Check(seen.frameRight > 0 && seen.frameRight * 2 >= seen.frameLeft &&
                   seen.frameLeft * 2 >= seen.frameRight,
                 "on screen: the right edge carries as much border as the left");
-            Check(seen.frameTop * 2 >= Scaled(W) * 3 && seen.frameBottom * 2 >= Scaled(W) * 3,
-                "on screen: the top and bottom borders are drawn whole, not half clipped away");
-            Check(seen.frameLeft * 2 >= Scaled(H_COLLAPSED) * 3 && seen.frameRight * 2 >= Scaled(H_COLLAPSED) * 3,
-                "on screen: the left and right borders are drawn whole too");
+            // Each side is exactly one pixel thick: one border pixel per column of the top and bottom, and
+            // per row of the left and right. Too many means the hairline was drawn twice or blurred over
+            // two columns (a stroked path does that), too few means half of it fell outside the window
+            // region — both of which are "the border does not look complete", just in different ways.
+            Check(seen.frameTop >= Scaled(W) - 4 && seen.frameTop <= Scaled(W) + 4 &&
+                  seen.frameBottom >= Scaled(W) - 4 && seen.frameBottom <= Scaled(W) + 4,
+                "on screen: the top and bottom borders are one pixel thick");
+            Check(seen.frameLeft >= Scaled(H_COLLAPSED) - 4 && seen.frameLeft <= Scaled(H_COLLAPSED) + 8 &&
+                  seen.frameRight >= Scaled(H_COLLAPSED) - 4 && seen.frameRight <= Scaled(H_COLLAPSED) + 8,
+                "on screen: the left and right borders are one pixel thick");
+            // And each side is exactly one pixel of the full border colour at its own edge. A stroked
+            // hairline spread itself over two columns and did it differently on the two sides, which is
+            // what "the border is not complete" looked like on screen.
+            std::printf("      middle line per side (grey/full): left %d/%d, right %d/%d, top %d/%d, bottom %d/%d\n",
+                seen.midLeft, seen.midLeftFull, seen.midRight, seen.midRightFull,
+                seen.midTop, seen.midTopFull, seen.midBottom, seen.midBottomFull);
+            Check(seen.midLeft == 1 && seen.midLeftFull == 1 && seen.midRight == 1 && seen.midRightFull == 1 &&
+                  seen.midTop == 1 && seen.midTopFull == 1 && seen.midBottom == 1 && seen.midBottomFull == 1,
+                "on screen: each side is exactly one full pixel of #B8B8B8, so all four sides match");
             // The bug this replaced: the pair's plate was derived from the minimize button, so once
             // close led the row the plate covered the left half of the start button and the divider
             // was drawn on the outside edge. Both are read off the screen here.
